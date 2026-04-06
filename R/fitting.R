@@ -100,13 +100,13 @@ get_stop_criteria <- function(stage, stop_criteria, type){
   }
   if(stage == "sample"){
     if(!is.null(stop_criteria$max_flat_loc)){
-      if(is.null(stop_criteria$flat_selection)) stop_criteria$flat_selection <- c("alpha", "subj_ll", "theta_mu")
+      if(is.null(stop_criteria$flat_selection)) stop_criteria$flat_selection <- c("alpha", "subj_ll", "summed_subj_ll", "theta_mu")
       if(is.null(stop_criteria$flat_p1)) stop_criteria$flat_p1 <- 1/3
       if(is.null(stop_criteria$flat_p2)) stop_criteria$flat_p2 <- 1/3
       if(stop_criteria$flat_p1 <= 0 || stop_criteria$flat_p1 > 1) stop("flat_p1 must be in (0, 1].")
       if(stop_criteria$flat_p2 <= 0 || stop_criteria$flat_p2 > 1) stop("flat_p2 must be in (0, 1].")
-      if(!all(stop_criteria$flat_selection %in% c("alpha", "subj_ll", "theta_mu", "theta_var"))){
-        stop("flat_selection must be one or more of: alpha, subj_ll, theta_mu, theta_var")
+      if(!all(stop_criteria$flat_selection %in% c("alpha", "subj_ll", "summed_subj_ll", "theta_mu", "theta_var"))){
+        stop("flat_selection must be one or more of: alpha, subj_ll, summed_subj_ll, theta_mu, theta_var")
       }
     }
     if(!is.null(stop_criteria$max_sample_iter) && stop_criteria$max_sample_iter < 10){

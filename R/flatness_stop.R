@@ -38,6 +38,12 @@
   mat
 }
 
+.flat_mat_summed_subj_ll <- function(emc, stage = "sample") {
+  mat <- .flat_mat_subj_ll(emc, stage = stage)
+  if (nrow(mat) == 0) return(matrix(numeric(0), nrow = 0, ncol = 1))
+  matrix(rowSums(mat), ncol = 1, dimnames = list(NULL, "summed_subj_ll"))
+}
+
 .flat_mat_alpha <- function(emc, stage = "sample") {
   c_n <- length(emc)
   idx_list <- lapply(emc, .flat_stage_indices, stage = stage)
@@ -118,6 +124,7 @@
 .get_flat_matrix <- function(emc, selection, stage = "sample") {
   if (selection == "alpha") return(.flat_mat_alpha(emc, stage = stage))
   if (selection == "subj_ll") return(.flat_mat_subj_ll(emc, stage = stage))
+  if (selection == "summed_subj_ll") return(.flat_mat_summed_subj_ll(emc, stage = stage))
   if (selection == "theta_mu") return(.flat_mat_theta_mu(emc, stage = stage))
   if (selection == "theta_var") return(.flat_mat_theta_var(emc, stage = stage))
   stop("Unknown flatness selection: ", selection)
