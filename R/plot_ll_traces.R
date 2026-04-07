@@ -39,11 +39,14 @@
   shape * log(rate) - lgamma(shape) - (shape + 1) * log(x) - rate / x
 }
 
-.diwish_log_unnorm <- function(Sigma, df, S) {
+.diwish_log <- function(Sigma, df, S) {
   p            <- nrow(Sigma)
   logdet_Sigma <- as.numeric(determinant(Sigma, logarithm = TRUE)$modulus)
+  logdet_S     <- as.numeric(determinant(S,     logarithm = TRUE)$modulus)
   Sigma_inv    <- solve(Sigma)
-  -0.5 * (df + p + 1) * logdet_Sigma - 0.5 * sum(diag(S %*% Sigma_inv))
+  0.5 * df * logdet_S -
+    0.5 * (df + p + 1) * logdet_Sigma -
+    0.5 * sum(diag(S %*% Sigma_inv))
 }
 
 .complete_standard_prior <- function(prior, p, mu_dim) {
@@ -86,7 +89,7 @@
   for (i in seq_len(n_iter)) {
     S_i  <- 2 * prior$v * diag(1 / a_half[, i], p)
     df_i <- prior$v + p - 1
-    out[i] <- .diwish_log_unnorm(Sigma = theta_var[, , i], df = df_i, S = S_i)
+    out[i] <- .diwish_log(Sigma = theta_var[, , i], df = df_i, S = S_i)
   }
   out
 }
