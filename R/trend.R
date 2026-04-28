@@ -337,7 +337,7 @@ make_trend <- function(par_names, cov_names = NULL, kernels, bases = NULL,
     trend$par_input <- unlist(par_input[[i]])
     trend$phase <- phase[i]
     if(is.null(ffill_na[i])) {
-      if(trend$kernel %in% c('delta', 'delta2kernel', 'delta2lr')) trend$ffill_na <- TRUE else trend$ffill_na <- FALSE
+      if(trend$kernel %in% c('delta', 'delta2kernel', 'delta2lr', 'rw')) trend$ffill_na <- TRUE else trend$ffill_na <- FALSE
     } else {
       trend$ffill_na <- ffill_na[i]
     }
@@ -362,7 +362,7 @@ make_trend <- function(par_names, cov_names = NULL, kernels, bases = NULL,
     }
   }
   attr(trends_out, "shared") <- shared
-  attr(trends_out, "sequential") <- any(kernels %in% c("delta", "delta2kernel", "delta2lr"))
+  attr(trends_out, "sequential") <- any(kernels %in% c("delta", "delta2kernel", "delta2lr", "rw"))
 
   return(trends_out)
 }
@@ -539,6 +539,13 @@ run_kernel <- function(trend_pars = NULL, kernel, input, funptr = NULL, at_facto
     expand_idx <- seq_len(n)
     tpars_comp <- trend_pars
     use_at <- FALSE
+  }
+
+  # RW kernel: compound-PE across all features simultaneously — short-circuits per-column loop.
+  if (identical(kernel, "rw")) {
+    input_comp <- input[first_level, , drop = FALSE]
+    rw_out     <- run_rw(tpars_comp[, 1L], tpars_comp[, 2L], input_comp)
+    return(rw_out[expand_idx, , drop = FALSE])
   }
 
   # Per-column contribution, then return matrix with one column per input
@@ -900,6 +907,43 @@ run_delta2lr <- function(q0,alphaPos,alphaNeg,covariate) {
   return(q)
 }
 
+run_rw <- function(q0, alpha, covariate_matrix) {
+  # Rescorla-Wagner kernel with compound prediction error.
+  # covariate_matrix: n_trials x (n_features + 1); last column is a binary
+  # isReset flag (1 = end of block, hard-reset all features to q0).
+  # On normal trials the PE is reward - sum(Q[chosen features]), so all
+  # co-chosen features update with the same error signal.
+  # Returns n_trials x (n_features + 1); last column is always 0 (map
+  # weight for isReset is 0 everywhere, so it never contributes to drift).
+  n     <- nrow(covariate_matrix)
+  n_all <- ncol(covariate_matrix)
+  n_feats <- n_all - 1L
+
+  Q        <- matrix(q0[1L], nrow = n, ncol = n_all)
+  Q[, n_all] <- 0  # isReset column: always 0 in output
+
+  if (n == 1L) return(Q)
+
+  for (i in seq_len(n - 1L)) {
+    if (isTRUE(covariate_matrix[i, n_all] == 1)) {
+      # Reset trial: bypass learning rule, set all features back to q0
+      Q[i + 1L, seq_len(n_feats)] <- q0[1L]
+    } else {
+      chosen <- which(!is.na(covariate_matrix[i, seq_len(n_feats)]))
+      if (length(chosen) == 0L) {
+        # No feature chosen this trial: carry everything forward
+        Q[i + 1L, seq_len(n_feats)] <- Q[i, seq_len(n_feats)]
+      } else {
+        reward <- covariate_matrix[i, chosen[1L]]
+        PE     <- reward - sum(Q[i, chosen])
+        Q[i + 1L, seq_len(n_feats)] <- Q[i, seq_len(n_feats)]  # carry all fwd
+        Q[i + 1L, chosen]           <- Q[i, chosen] + alpha[i] * PE
+      }
+    }
+  }
+  Q
+}
+
 
 ##' Register a custom C++ trend kernel
 ##'
@@ -1086,6 +1130,16 @@ get_kernels <- function() {
                  default_pars = c("q0", "alpha"),
                  transforms = list(func = list("q0" = "identity", "alpha" = "pnorm")),
                  bases = base_2p),
+    rw = list(description = paste(
+              "Rescorla-Wagner kernel: k = q[i].\n",
+              "        Compound PE: PE = reward - sum(Q[chosen features]).\n",
+              "        All co-chosen features update with the same error signal.\n",
+              "        Last covariate column must be a binary isReset flag (1 = reset).\n",
+              "        Parameters: q0 (initial value), alpha (learning rate)."
+              ),
+              default_pars = c("q0", "alpha"),
+              transforms = list(func = list("q0" = "identity", "alpha" = "pnorm")),
+              bases = base_2p),
     delta2kernel = list(description = paste(
                 "Dual kernel delta rule: k = q[i].\n",
                   "         Combines fast and slow learning rates\n",

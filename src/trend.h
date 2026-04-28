@@ -116,6 +116,51 @@ inline IntegerVector build_expand_idx_rcpp(const LogicalVector& first_level) {
   return expand_idx;
 }
 
+// Rescorla-Wagner compound-PE kernel.
+// cov_matrix cols: [feature_1, feature_2, ..., feature_K, isReset]
+//   non-NA feature col on trial i  -> feature was in the chosen option; value = reward
+//   NA feature col on trial i      -> feature NOT chosen (no update)
+//   last col (isReset) == 1        -> hard-reset all feature Q-values to q0 on NEXT trial
+// Returns a matrix of the same shape: Q[i,j] = Q-value entering trial i.
+// The isReset output column is always 0.
+NumericMatrix run_rw_rcpp(NumericVector q0, NumericVector alpha, NumericMatrix cov_matrix) {
+  const int n      = cov_matrix.nrow();
+  const int n_all  = cov_matrix.ncol();
+  const int n_feats = n_all - 1;
+  NumericMatrix Q(n, n_all);
+  for (int i = 0; i < n; i++) {
+    for (int j = 0; j < n_feats; j++) Q(i, j) = q0[i];
+    Q(i, n_all - 1) = 0.0;  // isReset output column always 0
+  }
+  if (n == 1) return Q;
+  for (int i = 0; i < n - 1; i++) {
+    if (cov_matrix(i, n_all - 1) == 1.0) {
+      // Hard reset: next row initialises to q0
+      for (int j = 0; j < n_feats; j++) Q(i + 1, j) = q0[i + 1];
+    } else {
+      // Carry all features forward; then update chosen ones
+      for (int j = 0; j < n_feats; j++) Q(i + 1, j) = Q(i, j);
+      // Identify chosen features and collect reward from first chosen column
+      std::vector<int> chosen;
+      double reward = 0.0;
+      bool reward_set = false;
+      for (int j = 0; j < n_feats; j++) {
+        if (!NumericVector::is_na(cov_matrix(i, j))) {
+          chosen.push_back(j);
+          if (!reward_set) { reward = cov_matrix(i, j); reward_set = true; }
+        }
+      }
+      if (!chosen.empty()) {
+        // Compound PE: reward - sum(Q_chosen)
+        double sumQ = 0.0;
+        for (int idx : chosen) sumQ += Q(i, idx);
+        double PE = reward - sumQ;
+        for (int idx : chosen) Q(i + 1, idx) = Q(i, idx) + alpha[i] * PE;
+      }
+    }
+  }
+  return Q;
+}
 
 NumericMatrix run_kernel_rcpp(NumericMatrix kernel_pars,
                               String kernel,
@@ -208,6 +253,20 @@ NumericMatrix run_kernel_rcpp(NumericMatrix kernel_pars,
       // out(i,0) += comp_out[idx];
     }
     return out;
+  }
+
+  // RW kernel: compound-PE update across all chosen features simultaneously.
+  // Must be handled before the per-column loop (PE = reward - sum(Q_all_chosen)).
+  if (kernel == "rw") {
+    NumericMatrix rw_out = run_rw_rcpp(kp_comp(_, 0), kp_comp(_, 1), input_comp);
+    // rw_out has same ncol as input_comp; expand rows back to full n
+    const int n_out_cols = rw_out.ncol();
+    NumericMatrix rw_expanded(n, n_out_cols);
+    for (int i = 0; i < n; ++i) {
+      int idx = expand_idx[i] - 1;
+      for (int j = 0; j < n_out_cols; ++j) rw_expanded(i, j) = rw_out(idx, j);
+    }
+    return rw_expanded;
   }
 
   for (int c = 0; c < p; ++c) {

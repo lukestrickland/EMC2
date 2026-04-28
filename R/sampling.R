@@ -676,6 +676,9 @@ calc_ll_manager <- function(proposals, dadm, model, component = NULL, r_cores = 
   } else{
     model <- model()
 
+    has_rw_kernel <- !is.null(model$trend) &&
+      any(vapply(model$trend, function(t) identical(t$kernel, "rw"), logical(1)))
+
     if(is.null(model$c_name)){ # use the R implementation
       lls <- unlist(
         auto_mclapply(1:nrow(proposals),
@@ -689,8 +692,13 @@ calc_ll_manager <- function(proposals, dadm, model, component = NULL, r_cores = 
       }
       constants <- attr(dadm, "constants")
       if(is.null(constants)) constants <- NA
-      if (nrow(proposals) <= r_cores) {
-        if(!use_oo) {
+      # The OO (TrendRuntime) path has no "rw" case and stops with "Unknown kernel type".
+      # Force the non-OO calc_ll path when an rw kernel is present.
+      use_oo_eff <- if(has_rw_kernel) FALSE else use_oo
+      if (r_cores == 1L || nrow(proposals) <= r_cores) {
+        # Single-core or fewer proposals than cores: call C++ directly.
+        # Avoids auto_mclapply / PSOCK overhead for nested workers.
+        if(!use_oo_eff) {
         lls <- calc_ll(proposals, dadm, constants = constants, designs = designs, type = model$c_name,
                      model$bound, model$transform, model$pre_transform, p_types = p_types, min_ll = log(1e-10),
                      model$trend)
@@ -701,7 +709,7 @@ calc_ll_manager <- function(proposals, dadm, model, component = NULL, r_cores = 
         }
       } else {
         idx <- rep(1:r_cores,each=1+(nrow(proposals) %/% r_cores))[1:nrow(proposals)]
-        if(!use_oo) {
+        if(!use_oo_eff) {
           lls <- unlist(auto_mclapply(1:r_cores,function(i) {
             calc_ll(proposals[idx==i,,drop=FALSE], dadm, constants = constants,
               designs = designs, type = model$c_name, model$bound, model$transform,
