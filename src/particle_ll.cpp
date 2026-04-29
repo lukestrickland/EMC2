@@ -484,121 +484,127 @@ double c_log_likelihood_race(NumericMatrix pars, DataFrame data,
 
 
 
-// //#// [[Rcpp::export]]
-// NumericVector calc_ll(NumericMatrix p_matrix, DataFrame data, NumericVector constants,
-//                       List designs, String type, List bounds, List transforms, List pretransforms,
-//                       CharacterVector p_types, double min_ll, Rcpp::Nullable<Rcpp::List> trend = R_NilValue){ //,
-// //            bool debug_first_particle = false){
-//   const int n_particles = p_matrix.nrow();
-//   const int n_trials = data.nrow();
-//   NumericVector lls(n_particles);
-//   NumericVector p_vector(p_matrix.ncol());
-//   CharacterVector p_names = colnames(p_matrix);
-//   p_vector.names() = p_names;
-//   NumericMatrix pars;
-//   LogicalVector is_ok(n_trials);
-//
-//   // Once (outside the main loop over particles):
-//   NumericMatrix minmax = bounds["minmax"];
-//   CharacterVector mm_names = colnames(minmax);
-//   std::vector<PreTransformSpec> p_specs;
-//   std::vector<BoundSpec> bound_specs;
-//   std::vector<TransformSpec> full_t_specs; // precomputed transform specs for p_types
-//
-//   /// build trend plan, runtime (only needed for new pathway), and paramtable
-//   NumericVector dummy_p = clone(p_vector);
-//   ParamTable pt_template = ParamTable::from_p_vector_and_designs(dummy_p, designs, data.nrow());
-//   std::vector<TransformSpec> full_specs_new;
-//
-//   Rcpp::List trend_list;
-//
-//   if (!trend.isNull()) {
-//     trend_list = Rcpp::List(trend);   // safe: wraps the underlying SEXP
-//   } else {
-//     trend_list = Rcpp::List::create();  // or Rcpp::List(); empty list
-//   }
-//   if(type == "DDM"){
-//     IntegerVector expand = data.attr("expand");
-//     for(int i = 0; i < n_particles; i++){
-//       p_vector = p_matrix(i, _);
-//       if(i == 0){
-//         p_specs = make_pretransform_specs(p_vector, pretransforms);
-//         // Precompute transform specs for all p_types using a one-time dummy
-//         NumericMatrix dummy(1, p_types.size());
-//         colnames(dummy) = p_types;
-//         full_t_specs = make_transform_specs(dummy, transforms);
-//       }
-//         pars = get_pars_matrix(p_vector, constants, p_specs, p_types, designs, n_trials, data, trend_list, full_t_specs);
-//       // Precompute specs
-//       if (i == 0) {                            // first particle only, just to get colnames
-//         bound_specs = make_bound_specs(minmax,mm_names,pars,bounds);
-//       }
-//       is_ok = c_do_bound(pars, bound_specs);
-//       lls[i] = c_log_likelihood_DDM(pars, data, n_trials, expand, min_ll, is_ok);
-//     }
-//   } else if(type == "MRI" || type == "MRI_AR1"){
-//     int n_pars = p_types.length();
-//     NumericVector y = extract_y(data);
-//     for(int i = 0; i < n_particles; i++){
-//       p_vector = p_matrix(i, _);
-//       if(i == 0){
-//         p_specs = make_pretransform_specs(p_vector, pretransforms);
-//         // Precompute transform specs for all p_types using a one-time dummy
-//         NumericMatrix dummy(1, p_types.size());
-//         colnames(dummy) = p_types;
-//         full_t_specs = make_transform_specs(dummy, transforms);
-//       }
-//         pars = get_pars_matrix(p_vector, constants, p_specs, p_types, designs, n_trials, data, trend_list, full_t_specs);
-//       // Precompute specs
-//       if (i == 0) {                            // first particle only, just to get colnames
-//         bound_specs = make_bound_specs(minmax,mm_names,pars,bounds);
-//       }
-//       is_ok = c_do_bound(pars, bound_specs);
-//       if(type == "MRI"){
-//         lls[i] = c_log_likelihood_MRI(pars, y, is_ok, n_trials, n_pars, min_ll);
-//       } else{
-//         lls[i] = c_log_likelihood_MRI_white(pars, y, is_ok, n_trials, n_pars, min_ll);
-//       }
-//     }
-//   } else{
-//     IntegerVector expand = data.attr("expand");
-//     LogicalVector winner = data["winner"];
-//     // Love me some good old ugly but fast c++ pointers
-//     NumericVector (*dfun)(NumericVector, NumericMatrix, LogicalVector, double, LogicalVector);
-//     NumericVector (*pfun)(NumericVector, NumericMatrix, LogicalVector, double, LogicalVector);
-//     if(type == "LBA"){
-//       dfun = dlba_c;
-//       pfun = plba_c;
-//     } else if(type == "RDM"){
-//       dfun = drdm_c;
-//       pfun = prdm_c;
-//     } else {
-//       dfun = dlnr_c;
-//       pfun = plnr_c;
-//     }
-//     NumericVector lR = data["lR"];
-//     int n_lR = unique(lR).length();
-//     for (int i = 0; i < n_particles; ++i) {
-//       p_vector = p_matrix(i, _);
-//       if(i == 0){
-//         p_specs = make_pretransform_specs(p_vector, pretransforms);
-//         // Precompute transform specs for all p_types using a one-time dummy
-//         NumericMatrix dummy(1, p_types.size());
-//         colnames(dummy) = p_types;
-//         full_t_specs = make_transform_specs(dummy, transforms);
-//       }
-//
-//       pars = get_pars_matrix(p_vector, constants, p_specs, p_types, designs, n_trials, data, trend_list, full_t_specs);
-//       if (i == 0) {                            // first particle only, just to get colnames
-//         bound_specs = make_bound_specs(minmax,mm_names,pars,bounds);
-//       }
-//       is_ok = c_do_bound(pars, bound_specs);
-//       is_ok = lr_all(is_ok, n_lR);
-//       lls[i] = c_log_likelihood_race(pars, data, dfun, pfun, n_trials, winner, expand, min_ll, is_ok);
-//     }
-//   }
-//   return(lls);
-// }
+// [[Rcpp::export]]
+NumericVector calc_ll(NumericMatrix p_matrix, DataFrame data, NumericVector constants,
+                      List designs, String type, List bounds, List transforms, List pretransforms,
+                      CharacterVector p_types, double min_ll, Rcpp::Nullable<Rcpp::List> trend = R_NilValue){ //,
+  //            bool debug_first_particle = false){
+  const int n_particles = p_matrix.nrow();
+  const int n_trials = data.nrow();
+  NumericVector lls(n_particles);
+  NumericVector p_vector(p_matrix.ncol());
+  CharacterVector p_names = colnames(p_matrix);
+  p_vector.names() = p_names;
+  NumericMatrix pars;
+  LogicalVector is_ok_lv(n_trials);
+  std::vector<int> is_ok_int(n_trials, 1);
+
+  // Once (outside the main loop over particles):
+  NumericMatrix minmax = bounds["minmax"];
+  CharacterVector mm_names = colnames(minmax);
+  std::vector<PreTransformSpec> p_specs;
+  std::vector<BoundSpec> bound_specs;
+  std::vector<TransformSpec> full_t_specs; // precomputed transform specs for p_types
+
+  /// build trend plan, runtime (only needed for new pathway), and paramtable
+  NumericVector dummy_p = clone(p_vector);
+  ParamTable pt_template = ParamTable::from_p_vector_and_designs(dummy_p, designs, data.nrow());
+  std::vector<TransformSpec> full_specs_new;
+
+  Rcpp::List trend_list;
+
+  if (!trend.isNull()) {
+    trend_list = Rcpp::List(trend);   // safe: wraps the underlying SEXP
+  } else {
+    trend_list = Rcpp::List::create();  // or Rcpp::List(); empty list
+  }
+  if(type == "DDM"){
+    IntegerVector expand = data.attr("expand");
+    for(int i = 0; i < n_particles; i++){
+      p_vector = p_matrix(i, _);
+      if(i == 0){
+        p_specs = make_pretransform_specs(p_vector, pretransforms);
+        // Precompute transform specs for all p_types using a one-time dummy
+        NumericMatrix dummy(1, p_types.size());
+        colnames(dummy) = p_types;
+        full_t_specs = make_transform_specs(dummy, transforms);
+      }
+      pars = get_pars_matrix(p_vector, constants, p_specs, p_types, designs, n_trials, data, trend_list, full_t_specs);
+      // Precompute specs
+      if (i == 0) {                            // first particle only, just to get colnames
+        bound_specs = make_bound_specs(minmax,mm_names,pars,bounds);
+      }
+      is_ok_lv = c_do_bound(pars, bound_specs);
+      is_ok_int.assign(is_ok_lv.begin(), is_ok_lv.end());
+      lls[i] = c_log_likelihood_DDM(pars, data, n_trials, expand, min_ll, is_ok_int);
+    }
+  } else if(type == "MRI" || type == "MRI_AR1"){
+    int n_pars = p_types.length();
+    NumericVector y = extract_y(data);
+    for(int i = 0; i < n_particles; i++){
+      p_vector = p_matrix(i, _);
+      if(i == 0){
+        p_specs = make_pretransform_specs(p_vector, pretransforms);
+        // Precompute transform specs for all p_types using a one-time dummy
+        NumericMatrix dummy(1, p_types.size());
+        colnames(dummy) = p_types;
+        full_t_specs = make_transform_specs(dummy, transforms);
+      }
+      pars = get_pars_matrix(p_vector, constants, p_specs, p_types, designs, n_trials, data, trend_list, full_t_specs);
+      // Precompute specs
+      if (i == 0) {                            // first particle only, just to get colnames
+        bound_specs = make_bound_specs(minmax,mm_names,pars,bounds);
+      }
+      is_ok_lv = c_do_bound(pars, bound_specs);
+      is_ok_int.assign(is_ok_lv.begin(), is_ok_lv.end());
+      if(type == "MRI"){
+        lls[i] = c_log_likelihood_MRI(pars, y, is_ok_int, n_trials, n_pars, min_ll);
+      } else{
+        lls[i] = c_log_likelihood_MRI_white(pars, y, is_ok_int, n_trials, n_pars, min_ll);
+      }
+    }
+  } else{
+    IntegerVector expand = data.attr("expand");
+    LogicalVector winner = data["winner"];
+    // Love me some good old ugly but fast c++ pointers
+    NumericVector (*dfun)(NumericVector, NumericMatrix, LogicalVector, double, LogicalVector);
+    NumericVector (*pfun)(NumericVector, NumericMatrix, LogicalVector, double, LogicalVector);
+    if(type == "LBA"){
+      dfun = dlba_c;
+      pfun = plba_c;
+    } else if(type == "RDM"){
+      dfun = drdm_c;
+      pfun = prdm_c;
+    } else {
+      dfun = dlnr_c;
+      pfun = plnr_c;
+    }
+    NumericVector lR = data["lR"];
+    int n_lR = unique(lR).length();
+    for (int i = 0; i < n_particles; ++i) {
+      p_vector = p_matrix(i, _);
+      if(i == 0){
+        p_specs = make_pretransform_specs(p_vector, pretransforms);
+        // Precompute transform specs for all p_types using a one-time dummy
+        NumericMatrix dummy(1, p_types.size());
+        colnames(dummy) = p_types;
+        full_t_specs = make_transform_specs(dummy, transforms);
+      }
+
+      pars = get_pars_matrix(p_vector, constants, p_specs, p_types, designs, n_trials, data, trend_list, full_t_specs);
+      if (i == 0) {                            // first particle only, just to get colnames
+        bound_specs = make_bound_specs(minmax,mm_names,pars,bounds);
+      }
+      is_ok_lv = c_do_bound(pars, bound_specs);
+      is_ok_int.assign(is_ok_lv.begin(), is_ok_lv.end());
+      lr_all(is_ok_int, n_lR);
+      lls[i] = c_log_likelihood_race(pars, data, dfun, pfun, n_trials, winner, expand, min_ll,
+                                     LogicalVector(is_ok_int.begin(), is_ok_int.end()));
+    }
+  }
+  return(lls);
+}
+
 
 
 

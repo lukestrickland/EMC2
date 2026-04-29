@@ -1036,7 +1036,7 @@ has_delta_rules <- function(model) {
   if(is.null(trend)) return(FALSE)
 
   for(trend_n in 1:length(trend)) {
-    if(trend[[trend_n]]$kernel %in% c('delta', 'delta2kernel', 'delta2lr')) return(TRUE)
+    if(trend[[trend_n]]$kernel %in% c('delta', 'delta2kernel', 'delta2lr', 'rw')) return(TRUE)
   }
   return(FALSE)
 }
