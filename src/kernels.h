@@ -1357,7 +1357,7 @@ public:
 
 // =============================================================================
 // DBMKernel  —  Dynamic Belief Model
-// Yu & Cohen (2008), Ide et al. (2013)
+// Yu & Cohen (2008), NeurIPS; Ide et al. (2013), JoN
 // Parameters: cp, mu0, s0
 // kernel_args: grid_res (default 100)
 // =============================================================================
@@ -1458,7 +1458,7 @@ public:
 
 // =============================================================================
 // TPMKernel  —  Transition Probability Model
-// Yu & Cohen (2008)
+// Meyniel et al. (2016), PLOS CB
 // Parameters: cp, a0, b0
 // kernel_args: grid_res (default 100)
 // =============================================================================

@@ -1086,7 +1086,7 @@ get_kernels <- function() {
     experimental = TRUE,
     NA_allowed=TRUE),
   tpm = list(
-    description  = "Transition Probability Model (Yu & Cohen 2008).",
+    description  = "Transition Probability Model (Meyniel et al. 2016).",
     default_pars = c("cp", "a0", "b0"),
     transforms   = list(func = list("cp" = "pnorm", "a0" = "exp", "b0" = "exp")),
     bases        = base_2p,
