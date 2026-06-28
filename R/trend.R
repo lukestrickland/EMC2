@@ -743,6 +743,17 @@ update_model_trend <- function(trend, model) {
     }
   }
 
+  # A trend parameter shared across kernels/bases (e.g. one v.q0 used by two kernels)
+  # is added once PER kernel above, so it lands in p_types / transform$func multiple
+  # times -- but get_trend_pnames() (and hence sampled_pars) lists it ONCE. That
+  # length mismatch makes fill_transform() mis-align the transforms (the duplicate
+  # slot falls back to "identity", silently un-bounding a pnorm/exp parameter).
+  # Collapse the duplicates here so p_types / transforms match the unique sampled
+  # parameters. Native model params are unique-named (and trend params are prefixed,
+  # e.g. v.q0 / v.w_d), so this only removes genuine shared-trend duplicates.
+  model_list$transform$func <- model_list$transform$func[!duplicated(names(model_list$transform$func))]
+  model_list$p_types        <- model_list$p_types[!duplicated(names(model_list$p_types))]
+
   model_list$trend <- trend
   model <- function() model_list
   model
@@ -1007,6 +1018,20 @@ get_kernels <- function() {
                  sequential   = TRUE,
                  n_outputs    = 2L,
                  NA_allowed=TRUE),
+    delta_plogis_q0 = list(description = paste(
+                 "Standard delta rule with a plogis-BOUNDED q0 (initial value in (0,1)).\n",
+                 "        Identical to `delta` except q0 is plogis-transformed, so it can SHARE a\n",
+                 "        single `v.q0` (by name) with the cardinality-saturation read-out kernel\n",
+                 "        delta_satlink_gamma_card (whose q0 is also plogis) without a transform\n",
+                 "        conflict. plogis (not pnorm) so q0 stays identified under saturation.\n",
+                 "        Parameters: q0 (initial value), alpha (learning rate)."
+                 ),
+                 default_pars = c("q0", "alpha"),
+                 transforms = list(func = list("q0" = "plogis", "alpha" = "pnorm")),
+                 bases = base_2p,
+                 sequential   = TRUE,
+                 n_outputs    = 2L,
+                 NA_allowed=TRUE),
     delta2lr = list(description = paste(
                 "Dual learning rate delta rule: k = q[i].\n",
                 "         Like the standard delta rule, but with separate\n",
@@ -1034,7 +1059,117 @@ get_kernels <- function() {
               bases = base_2p,
               sequential   = TRUE,
               n_outputs    = 2L,
-              experimental = TRUE,
+              # NOT experimental: make_kernel()'s trend_help() lookup hides experimental kernels
+              # (trend.R:558 with show_experimental=FALSE), so their q0/alpha pnames never register
+              # and the kernel receives 0 parameter columns at runtime (the rdm_*_rw models use it).
+              NA_allowed=TRUE),
+  delta_satlink_gamma_card = list(description = paste(
+                "Cardinality-saturation satlink read-out (delta).\n",
+                "         Learns one Q per elemental covariate (independent delta update),\n",
+                "         forms the directional difference D = (q_one1 + q_one2) - (q_two1 + q_two2)\n",
+                "         from the kernel_args feature-index columns, and emits the saturating link\n",
+                "         g = sat * tanh(D^gamma / sat) as an AllocShape [g, -g, 0, ...] stream\n",
+                "         (route per accumulator with a selector coding map, e.g. an advantage map).\n",
+                "         sat is chosen by VALUATION CARDINALITY: sat_double when a second feature is\n",
+                "         present on either option, else sat_single (a configural channel that passes\n",
+                "         no *_2 columns is always sat_single). Requires kernel_args: n_elem,\n",
+                "         feat_one_1_idx_column, feat_two_1_idx_column (+ optional feat_one_2_idx_column,\n",
+                "         feat_two_2_idx_column for two-item options) and optional q_reset_column.\n",
+                "         Parameters: q0, alpha, sat_single, sat_double, gamma."
+              ),
+              default_pars = c("q0", "alpha", "sat_single", "sat_double", "gamma"),
+              # q0 = plogis (logit), NOT pnorm: pnorm's thin Gaussian tails let q0 blow up
+              # on the unbounded sampled scale under the saturating (tanh) read-out, where q0
+              # is weakly identified. plogis's fatter tails keep a restoring gradient.
+              transforms = list(func = list("q0" = "plogis", "alpha" = "pnorm",
+                                            "sat_single" = "exp", "sat_double" = "exp",
+                                            "gamma" = "exp")),
+              bases = base_2p,
+              sequential   = TRUE,
+              n_outputs    = 1L,
+              NA_allowed=TRUE),
+  delta_satlink_gamma_card_expdecr = list(description = paste(
+                "Cardinality-saturation satlink read-out (delta) with an EXP-DECREASING rate.\n",
+                "         = delta_satlink_gamma_card + the delta_expdecr schedule. Same cardsat\n",
+                "         geometry/read-out (per-feature delta, directional D, cardinality-selected\n",
+                "         sat, AllocShape [g, -g, 0, ...]) but the per-trial learning rate is\n",
+                "         alpha_eff(t) = Phi(alpha_base + alpha_w * exp(-d_alpha_ed * block_trial)),\n",
+                "         with alpha_base on the probit scale and alpha_w, d_alpha_ed >= 0 (exp).\n",
+                "         Requires kernel_args: n_elem, feat_one_1_idx_column, feat_two_1_idx_column,\n",
+                "         block_trial_column (+ optional feat_one_2/feat_two_2 + q_reset_column).\n",
+                "         d_alpha_ed -> 0 or alpha_w -> 0 nests delta_satlink_gamma_card.\n",
+                "         Parameters: q0, alpha_base, alpha_w, d_alpha_ed, sat_single, sat_double, gamma."
+              ),
+              default_pars = c("q0", "alpha_base", "alpha_w", "d_alpha_ed",
+                               "sat_single", "sat_double", "gamma"),
+              # q0 = plogis (matches delta_satlink_gamma_card / delta_plogis_q0 for by-name sharing).
+              # alpha_base = identity (probit scale, fed to Phi); alpha_w, d_alpha_ed, sat*, gamma = exp (>=0).
+              transforms = list(func = list("q0" = "plogis", "alpha_base" = "identity",
+                                            "alpha_w" = "exp", "d_alpha_ed" = "exp",
+                                            "sat_single" = "exp", "sat_double" = "exp",
+                                            "gamma" = "exp")),
+              bases = base_2p,
+              sequential   = TRUE,
+              n_outputs    = 1L,
+              NA_allowed=TRUE),
+  delta_expdecr = list(description = paste(
+                "Standard delta rule with an EXP-DECREASING learning rate + plogis-bounded q0.\n",
+                "         alpha_eff(t) = Phi(alpha_base + alpha_w * exp(-d_alpha_ed * block_trial)),\n",
+                "         alpha_base on the probit scale; alpha_w, d_alpha_ed >= 0 (exp). q0 is plogis\n",
+                "         so it SHARES one v.q0 (by name) with delta_satlink_gamma_card_expdecr.\n",
+                "         Requires kernel_args$block_trial_column (within-block 0-based exposure count).\n",
+                "         Grouping-capable: a multi-column cov_names -> one independent delta per feature.\n",
+                "         Parameters: q0, alpha_base, alpha_w, d_alpha_ed."
+              ),
+              default_pars = c("q0", "alpha_base", "alpha_w", "d_alpha_ed"),
+              transforms = list(func = list("q0" = "plogis", "alpha_base" = "identity",
+                                            "alpha_w" = "exp", "d_alpha_ed" = "exp")),
+              bases = base_2p,
+              sequential   = TRUE,
+              n_outputs    = 2L,
+              NA_allowed=TRUE),
+  rw_satlink_gamma_card = list(description = paste(
+                "Cardinality-saturation satlink read-out with RESCORLA-WAGNER (shared/summed PE)\n",
+                "         learning. = delta_satlink_gamma_card but the per-feature INDEPENDENT delta\n",
+                "         update is replaced by the RW summed-error rule: prediction = sum of the\n",
+                "         chosen option's active cue Q's, one shared PE = (reward - sum) updates them\n",
+                "         all (cue competition). Read-out difference D spans up to 3 cues per option:\n",
+                "         feat_*_1, feat_*_2 (elemental) and the OPTIONAL feat_*_3 (configural compound),\n",
+                "         so a hybrid kernel over the combined {elem, cfg} cue set shares the PE across\n",
+                "         A, B and AB. Cardinality (sat_single/sat_double) is set by feat_*_2 only.\n",
+                "         Requires kernel_args: n_elem, feat_one_1_idx_column, feat_two_1_idx_column\n",
+                "         (+ optional feat_one_2/feat_two_2/feat_one_3/feat_two_3 + q_reset_column).\n",
+                "         Parameters: q0, alpha, sat_single, sat_double, gamma."
+              ),
+              default_pars = c("q0", "alpha", "sat_single", "sat_double", "gamma"),
+              # q0 = plogis (matches delta_satlink_gamma_card / delta_plogis_q0 for by-name sharing).
+              transforms = list(func = list("q0" = "plogis", "alpha" = "pnorm",
+                                            "sat_single" = "exp", "sat_double" = "exp",
+                                            "gamma" = "exp")),
+              bases = base_2p,
+              sequential   = TRUE,
+              n_outputs    = 1L,
+              NA_allowed=TRUE),
+  rw_satlink_gamma_card_ff = list(description = paste(
+                "FULL-FEEDBACK Rescorla-Wagner cardinality-saturation satlink read-out.\n",
+                "         = rw_satlink_gamma_card but the LEARNING does TWO per-option summed-error\n",
+                "         updates per trial (both options' outcomes are observed every trial):\n",
+                "         PE_one = r_one - sum(Q over option-1 cues); PE_two likewise for option 2,\n",
+                "         where r_one/r_two are read from each option's first cue covariate column\n",
+                "         (full-feedback covariates set every present cue to its OWN option's reward).\n",
+                "         Cues grouped by feat_one_* / feat_two_* (compound = optional 3rd cue). Single\n",
+                "         Q per cue. Read-out D = sum(Q over option 1) - sum(Q over option 2), satlinked.\n",
+                "         Requires kernel_args: n_elem, feat_one_1_idx_column, feat_two_1_idx_column\n",
+                "         (+ optional feat_one_2/feat_two_2/feat_one_3/feat_two_3 + q_reset_column).\n",
+                "         Parameters: q0, alpha, sat_single, sat_double, gamma."
+              ),
+              default_pars = c("q0", "alpha", "sat_single", "sat_double", "gamma"),
+              transforms = list(func = list("q0" = "plogis", "alpha" = "pnorm",
+                                            "sat_single" = "exp", "sat_double" = "exp",
+                                            "gamma" = "exp")),
+              bases = base_2p,
+              sequential   = TRUE,
+              n_outputs    = 1L,
               NA_allowed=TRUE),
   delta2kernel = list(description = paste(
                 "Dual kernel delta rule: k = q[i].\n",
@@ -1664,7 +1799,11 @@ make_data_unconditional <- function(data, pars, design, model,
       }
 
       dadm_subj_df[[R_col]][idx_curr]  <- Rrt[, "R"]
-      dadm_subj_df[[rt_col]][idx_curr] <- Rrt[, "rt"]
+      # Choice-only models (e.g. multinomial_logit / softmax) simulate R but no rt, so their
+      # rfun returns no "rt" column. Guard the assignment (dadm$rt stays NA, set at line ~1482).
+      if ("rt" %in% colnames(Rrt)) {
+        dadm_subj_df[[rt_col]][idx_curr] <- Rrt[, "rt"]
+      }
 
       # 9. Feedback functions (trend)
       if (has_feedback) {

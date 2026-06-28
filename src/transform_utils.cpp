@@ -26,6 +26,7 @@ std::vector<TransformSpec> make_transform_specs_matrix(const NumericMatrix& pars
         TransformCode code = IDENTITY;
         if (f == "exp")      code = EXP;
         else if (f == "pnorm") code = PNORM;
+        else if (f == "plogis") code = PLOGIS;
         codeMap.emplace(name, code);
       }
     }
@@ -91,6 +92,7 @@ std::vector<TransformSpec> make_transform_specs_pt(const ParamTable& pt, const L
         TransformCode code = IDENTITY;
         if (f == "exp")      code = EXP;
         else if (f == "pnorm") code = PNORM;
+        else if (f == "plogis") code = PLOGIS;
         codeMap.emplace(name, code);
       }
     }
@@ -163,6 +165,14 @@ NumericMatrix c_do_transform_matrix(NumericMatrix pars, const std::vector<Transf
       for (int i = 0; i < nrow; i++) {
         pars(i, col_idx) = lw +
           range * R::pnorm(pars(i, col_idx), 0.0, 1.0, 1, 0);
+      }
+      break;
+    }
+    case PLOGIS: {
+      double range = up - lw;
+      for (int i = 0; i < nrow; i++) {
+        pars(i, col_idx) = lw +
+          range * R::plogis(pars(i, col_idx), 0.0, 1.0, 1, 0);
       }
       break;
     }
@@ -267,6 +277,13 @@ void c_do_transform_pt(ParamTable& pt,
     for (int i = 0; i < nrow; ++i) {
       col[i] = lw + range * PNORM_STD(col[i], true, false);
       // col[i] = lw + range * R::pnorm(col[i], 0.0, 1.0, 1, 0);
+    }
+    break;
+    }
+    case PLOGIS: {
+    const double range = up - lw;
+    for (int i = 0; i < nrow; ++i) {
+      col[i] = lw + range * R::plogis(col[i], 0.0, 1.0, 1, 0);
     }
     break;
     }

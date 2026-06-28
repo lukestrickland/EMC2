@@ -54,6 +54,17 @@ struct KernelSpec {
 
   // kernel_args
   std::vector<int> q_reset_col;   // length n_trials, or empty
+  // delta_satlink_gamma_card feature-index columns (length n_trials each, or empty)
+  std::vector<int> feat_one_1_idx_col;
+  std::vector<int> feat_one_2_idx_col;
+  std::vector<int> feat_two_1_idx_col;
+  std::vector<int> feat_two_2_idx_col;
+  // rw_satlink_gamma_card hybrid: optional 3rd cue (configural compound) index per option
+  std::vector<int> feat_one_3_idx_col;
+  std::vector<int> feat_two_3_idx_col;
+  // delta_expdecr / delta_satlink_gamma_card_expdecr: within-block 0-based exposure count
+  std::vector<double> block_trial_col;
+  int              n_elem_arg = -1;
   KernelArgs       kernel_args;   // raw-pointer view; rebuilt via build_kernel_args()
 
   // custom kernel pointer (R_NilValue if not custom)
@@ -72,6 +83,14 @@ struct KernelSpec {
     kernel_args = KernelArgs{};
     if (!q_reset_col.empty())
       kernel_args.q_reset = q_reset_col.data();
+    if (!feat_one_1_idx_col.empty()) kernel_args.feat_one_1_idx = feat_one_1_idx_col.data();
+    if (!feat_one_2_idx_col.empty()) kernel_args.feat_one_2_idx = feat_one_2_idx_col.data();
+    if (!feat_two_1_idx_col.empty()) kernel_args.feat_two_1_idx = feat_two_1_idx_col.data();
+    if (!feat_two_2_idx_col.empty()) kernel_args.feat_two_2_idx = feat_two_2_idx_col.data();
+    if (!feat_one_3_idx_col.empty()) kernel_args.feat_one_3_idx = feat_one_3_idx_col.data();
+    if (!feat_two_3_idx_col.empty()) kernel_args.feat_two_3_idx = feat_two_3_idx_col.data();
+    if (!block_trial_col.empty()) kernel_args.block_trial = block_trial_col.data();
+    kernel_args.n_elem = n_elem_arg;
   }
 };
 

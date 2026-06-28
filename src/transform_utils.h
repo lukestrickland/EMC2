@@ -9,7 +9,8 @@
 enum TransformCode {
   IDENTITY = 0,
   EXP      = 1,
-  PNORM    = 2
+  PNORM    = 2,
+  PLOGIS   = 3
 };
 
 struct TransformSpec {
