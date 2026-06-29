@@ -127,11 +127,46 @@ static void build_kernel_input(KernelSpec& ks, const Rcpp::DataFrame& data)
   // par_input columns remain zero-initialised; filled per-particle at runtime
 }
 
+// Parse a 1-based integer index column named by kernel_args[[arg_name]] into dst,
+// preserving NA_INTEGER (absent feature). Used by delta_satlink_gamma_card.
+static void parse_idx_column(const Rcpp::List& ka, const char* arg_name,
+                             const Rcpp::DataFrame& data, std::vector<int>& dst)
+{
+  dst.clear();
+  if (!ka.containsElementNamed(arg_name)) return;
+  SEXP cns = ka[arg_name];
+  if (Rf_isNull(cns)) return;
+  std::string col_name = sexp_to_str(cns);
+  if (!data.containsElementNamed(col_name.c_str()))
+    Rf_error("kernel_args$%s: column '%s' not found", arg_name, col_name.c_str());
+  SEXP col = data[col_name.c_str()];
+  int n = data.nrows();
+  dst.resize(n);
+  if (TYPEOF(col) == INTSXP) {
+    const int* p = INTEGER(col);
+    std::copy(p, p + n, dst.data());
+  } else if (TYPEOF(col) == REALSXP) {
+    const double* p = REAL(col);
+    for (int i = 0; i < n; ++i)
+      dst[i] = ISNAN(p[i]) ? NA_INTEGER : static_cast<int>(p[i]);
+  } else {
+    Rf_error("kernel_args$%s: column '%s' must be integer or numeric", arg_name, col_name.c_str());
+  }
+}
+
 static void build_kernel_args(KernelSpec& ks,
                               const Rcpp::List& k_lst,
                               const Rcpp::DataFrame& data)
 {
   ks.q_reset_col.clear();
+  ks.feat_one_1_idx_col.clear();
+  ks.feat_one_2_idx_col.clear();
+  ks.feat_two_1_idx_col.clear();
+  ks.feat_two_2_idx_col.clear();
+  ks.feat_one_3_idx_col.clear();
+  ks.feat_two_3_idx_col.clear();
+  ks.block_trial_col.clear();
+  ks.n_elem_arg = -1;
 
   if (!k_lst.containsElementNamed("kernel_args")) { ks.build_kernel_args(); return; }
   SEXP ka_sexp = k_lst["kernel_args"];
@@ -158,6 +193,38 @@ static void build_kernel_args(KernelSpec& ks,
   if (ka.containsElementNamed("grid_res")) {
     SEXP gr = ka["grid_res"];
     if (!Rf_isNull(gr)) ks.kernel_args.grid_res = Rcpp::as<int>(gr);
+  }
+  // delta_satlink_gamma_card: per-trial 1-based feature-index columns + cardinality
+  parse_idx_column(ka, "feat_one_1_idx_column", data, ks.feat_one_1_idx_col);
+  parse_idx_column(ka, "feat_one_2_idx_column", data, ks.feat_one_2_idx_col);
+  parse_idx_column(ka, "feat_two_1_idx_column", data, ks.feat_two_1_idx_col);
+  parse_idx_column(ka, "feat_two_2_idx_column", data, ks.feat_two_2_idx_col);
+  parse_idx_column(ka, "feat_one_3_idx_column", data, ks.feat_one_3_idx_col);
+  parse_idx_column(ka, "feat_two_3_idx_column", data, ks.feat_two_3_idx_col);
+  // delta_expdecr / delta_satlink_gamma_card_expdecr: within-block 0-based exposure count (double)
+  if (ka.containsElementNamed("block_trial_column")) {
+    SEXP cns = ka["block_trial_column"];
+    if (!Rf_isNull(cns)) {
+      std::string col_name = sexp_to_str(cns);
+      if (!data.containsElementNamed(col_name.c_str()))
+        Rf_error("kernel_args$block_trial_column: column '%s' not found", col_name.c_str());
+      SEXP col = data[col_name.c_str()];
+      int n = data.nrows();
+      ks.block_trial_col.resize(n);
+      if (TYPEOF(col) == REALSXP) {
+        const double* p = REAL(col); std::copy(p, p + n, ks.block_trial_col.data());
+      } else if (TYPEOF(col) == INTSXP) {
+        const int* p = INTEGER(col);
+        for (int i = 0; i < n; ++i)
+          ks.block_trial_col[i] = (p[i] == NA_INTEGER) ? NA_REAL : static_cast<double>(p[i]);
+      } else {
+        Rf_error("kernel_args$block_trial_column: column '%s' must be numeric or integer", col_name.c_str());
+      }
+    }
+  }
+  if (ka.containsElementNamed("n_elem")) {
+    SEXP ne = ka["n_elem"];
+    if (!Rf_isNull(ne)) ks.n_elem_arg = Rcpp::as<int>(ne);
   }
   ks.build_kernel_args();
 }

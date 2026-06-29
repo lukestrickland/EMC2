@@ -32,6 +32,13 @@ do_pre_transform <- function(p_vector, transform)
     (transform$upper[names(p_vector)[isprobit]] -
        transform$lower[names(p_vector)[isprobit]]) *
     pnorm(p_vector[isprobit])
+
+  ## logistic link
+  isplogis <- transform$func[names(p_vector)] == "plogis"
+  p_vector[isplogis] <- transform$lower[names(p_vector)[isplogis]] +
+    (transform$upper[names(p_vector)[isplogis]] -
+       transform$lower[names(p_vector)[isplogis]]) *
+    plogis(p_vector[isplogis])
   p_vector
 }
 
@@ -173,8 +180,8 @@ get_p_types <- function(nams, reverse = FALSE){
 }
 
 fill_transform <- function(transform, model, p_vector,
-                           supported=c("identity","exp","pnorm"),
-                           has_lower=c("exp","pnorm"),has_upper=c("pnorm"),
+                           supported=c("identity","exp","pnorm","plogis"),
+                           has_lower=c("exp","pnorm","plogis"),has_upper=c("pnorm","plogis"),
                            is_pre = FALSE){
   if(!is.null(transform)){
     if (!all(transform$func %in% supported)){

@@ -173,6 +173,14 @@ get_pars_oo <- function(p, dadm, model,
     if (!is.null(cm)) {
       attr(cur_dadm, "covariate_maps") <- lapply(cm, function(m) m[row_idx, , drop = FALSE])
     }
+    # covariate_coding must be subset to this subject's rows too, exactly like
+    # covariate_maps above. Without this the per-subject cur_dadm shrinks but its
+    # coding matrices keep the full multi-subject nrow, so the C++ TrendPlan check
+    # (nrow(coding) == nrow(data)) fails ("covariate_coding[...] has wrong nrow").
+    cc <- attr(dadm, "covariate_coding")
+    if (!is.null(cc)) {
+      attr(cur_dadm, "covariate_coding") <- lapply(cc, function(m) m[row_idx, , drop = FALSE])
+    }
     pieces[[i]] <- call_one(cur_particles = particle_matrix[i, , drop = FALSE], cur_dadm = cur_dadm, row_idx = row_idx)
   }
 
