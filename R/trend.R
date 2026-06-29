@@ -743,6 +743,17 @@ update_model_trend <- function(trend, model) {
     }
   }
 
+  # A trend parameter shared across kernels/bases (e.g. one v.q0 used by two kernels)
+  # is added once PER kernel above, so it lands in p_types / transform$func multiple
+  # times -- but get_trend_pnames() (and hence sampled_pars) lists it ONCE. That
+  # length mismatch makes fill_transform() mis-align the transforms (the duplicate
+  # slot falls back to "identity", silently un-bounding a pnorm/exp parameter).
+  # Collapse the duplicates here so p_types / transforms match the unique sampled
+  # parameters. Native model params are unique-named (and trend params are prefixed,
+  # e.g. v.q0 / v.w_d), so this only removes genuine shared-trend duplicates.
+  model_list$transform$func <- model_list$transform$func[!duplicated(names(model_list$transform$func))]
+  model_list$p_types        <- model_list$p_types[!duplicated(names(model_list$p_types))]
+
   model_list$trend <- trend
   model <- function() model_list
   model
@@ -1022,6 +1033,22 @@ get_kernels <- function() {
               sequential   = TRUE,
               n_outputs    = 2L,
               NA_allowed   = TRUE),
+    pearcehall = list(description = paste(
+                "Pearce-Hall associability delta rule: k = q[i].\n",
+                "         Like the standard delta rule, but the learning rate is a latent\n",
+                "         'associability' that relaxes toward the absolute prediction error:\n",
+                "         alpha_{t+1} = eta*abs(PE_t) + (1-eta)*alpha_t.\n",
+                "         Parameters: q0 (initial value), alpha0 (initial learning rate),\n",
+                "         eta (mixing weight). Output streams: 1=Q, 2=PE, 3=alpha (associability)."
+              ),
+              default_pars = c("q0", "alpha0", "eta"),
+              transforms = list(func = list("q0" = "identity",
+                                            "alpha0" = "pnorm",
+                                            "eta" = "pnorm")),
+              bases = base_2p,
+              sequential   = TRUE,
+              n_outputs    = 3L,
+              NA_allowed=TRUE),
     delta_decoupled = list(description = paste(
               "Delta rule: k = q[i].\n",
               "         Standard delta rule:\n",
@@ -1070,13 +1097,19 @@ get_kernels <- function() {
               experimental=TRUE,
               NA_allowed=TRUE),
   beta_binomial = list(
-    description  = "Beta-Binomial ideal observer: tracks binary observations.",
+    description  = paste(
+      "Beta-Binomial ideal observer: k = E[p].\n",
+      "         Tracks a binary outcome with a Beta(a0,b0) prior, updated to\n",
+      "         a_t = a0 + hits, b_t = b0 + misses; k = a_t/(a_t+b_t).\n",
+      "         Parameters: a0, b0 (positive Beta prior pseudocounts).\n",
+      "         Output streams: 1=mean, 2=mode, 3=Shannon surprise."
+    ),
     default_pars = c("a0", "b0"),
     transforms   = list(func = list("a0" = "exp", "b0" = "exp")),
     bases        = base_2p,
     sequential   = TRUE,
     n_outputs    = 3L,
-    experimental = TRUE,
+    experimental = FALSE,
     NA_allowed=TRUE),
   beta_binomial_decay = list(
     description  = "Beta-Binomial with exponential decay on accumulated counts.",

@@ -45,6 +45,7 @@ enum class KernelType {
   DeltaDecoupled,
   // Delta2Kernel2,
   Delta2LR,
+  PearceHall,
   LinIncr,
   LinDecr,
   ExpIncr,
@@ -75,6 +76,7 @@ inline KernelMeta kernel_meta(KernelType kt) {
   case KernelType::DeltaDecoupled:
   case KernelType::Delta2Kernel:
   case KernelType::Delta2LR:
+  case KernelType::PearceHall:
   case KernelType::LinIncr:
   case KernelType::LinDecr:
   case KernelType::ExpIncr:
@@ -686,6 +688,121 @@ struct SimpleDelta : DeltaKernel {
 
              mark_run_complete();
            }
+};
+
+// PearceHallKernel — delta rule with Pearce-Hall associability (dynamic learning rate).
+// Like SimpleDelta, but the learning rate is itself a latent state ("associability") that
+// relaxes toward the absolute prediction error:
+//   PE_t        = cov_t - Q_t
+//   Q_{t+1}     = Q_t + alpha_t * PE_t
+//   alpha_{t+1} = eta * |PE_t| + (1 - eta) * alpha_t
+// Parameters: q0 (initial value), alpha0 (initial associability/learning rate), eta (mixing weight).
+// On a missing (NA) covariate, Q and alpha are carried forward unchanged (PE = NA).
+// Output streams: 1 = Q value, 2 = PE, 3 = alpha (associability trajectory); alphas_[j] is the
+// learning rate used on trial j.
+struct PearceHallKernel : DeltaKernel {
+protected:
+  std::vector<double> alphas_;            // per-trial associability (rate used at trial j)
+  mutable std::vector<double> alpha_buf_; // expand buffer for stream code 3
+
+public:
+  PearceHallKernel() {}
+
+  void reset() override {
+    DeltaKernel::reset();
+    alphas_.clear();
+    alpha_buf_.clear();
+  }
+
+  void run(const KernelParsView& kernel_pars,
+           const Mat& covariate,
+           const std::vector<int>& comp_idx) override {
+             if (kernel_pars.cols.size() != 3) {
+               Rcpp::stop("PearceHallKernel expects 3 parameter columns (q0, alpha0, eta), got %d",
+                          (int)kernel_pars.cols.size());
+             }
+
+             const int n_comp = static_cast<int>(comp_idx.size());
+             if (n_comp <= 0) {
+               out_.clear();
+               pes_.clear();
+               alphas_.clear();
+               mark_run_complete();
+               return;
+             }
+
+             out_.resize(n_comp);
+             pes_.resize(n_comp);
+             alphas_.resize(n_comp);
+             pes_[n_comp - 1] = NA_REAL;
+
+             const double* q0_col     = kernel_pars.cols[0];
+             const double* alpha0_col = kernel_pars.cols[1];
+             const double* eta_col    = kernel_pars.cols[2];
+             const double* cov_ptr    = covariate.colptr(0);
+
+             int row0   = comp_idx[0];
+             q_         = q0_col[row0];
+             double a   = alpha0_col[row0];
+             out_[0]    = q_;
+             alphas_[0] = a;
+
+             for (int j = 0; j < n_comp - 1; ++j) {
+               int r = comp_idx[j];
+               // --- RESET (before PE): reset both value and associability ---
+               if (q_reset_ && q_reset_[r]) {
+                 q_         = q0_col[r];
+                 a          = alpha0_col[r];
+                 out_[j]    = q_;
+                 alphas_[j] = a;
+               }
+
+               double x = cov_ptr[r];
+               if (!is_nan(x)) {
+                 double pe  = x - q_;
+                 double eta = eta_col[r];
+                 pes_[j]    = pe;
+                 q_        += a * pe;
+                 a          = std::fabs(pe) * eta + (1.0 - eta) * a;
+               } else {
+                 pes_[j] = NA_REAL;
+                 // associability carried forward unchanged on missing outcomes
+               }
+               out_[j + 1]    = q_;
+               alphas_[j + 1] = a;
+             }
+
+             mark_run_complete();
+           }
+
+  bool has_output_stream(int code) const override {
+    return (code >= 1 && code <= 3);
+  }
+
+  KernelOutput get_output_stream(int code) const override {
+    if (code == 1 || code == 2) return DeltaKernel::get_output_stream(code);
+    if (code == 3) {
+      const int n_full = static_cast<int>(out_.size());
+      alpha_buf_.resize(n_full);
+      if (!has_expand_idx_) {
+        if ((int)alphas_.size() != n_full)
+          Rcpp::stop("PearceHallKernel: alphas_ length mismatch");
+        for (int i = 0; i < n_full; ++i) alpha_buf_[i] = alphas_[i];
+      } else {
+        const auto& idx = expand_idx_;
+        for (int i = 0; i < n_full; ++i) alpha_buf_[i] = alphas_[idx[i] - 1];
+      }
+      return KernelOutput{ alpha_buf_.data(), n_full, 1 };
+    }
+    Rcpp::stop("PearceHallKernel::get_output_stream: unsupported code %d (1=Q,2=PE,3=alpha)", code);
+  }
+
+  std::string output_stream_name(int code) const override {
+    if (code == 1) return "Qvalue";
+    if (code == 2) return "PE";
+    if (code == 3) return "alpha";
+    throw std::runtime_error("PearceHallKernel::output_stream_name: unsupported code");
+  }
 };
 
 // Delta rule reparametrised to decouple the movement towards the outcome from the decay towards 0

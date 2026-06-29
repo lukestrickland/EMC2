@@ -157,6 +157,80 @@ test_that("delta2lr_Rcpp", {
 })
 
 
+# pearcehall (Pearce-Hall associability) ----------------------------------
+# Reference trace hand-computed from:  PE_t = cov_t - Q_t;  Q_{t+1} = Q_t + alpha_t*PE_t;
+#   alpha_{t+1} = eta*|PE_t| + (1-eta)*alpha_t.  On NA cov, Q/alpha carry, PE=NA.
+# q0 = 0, alpha0 = 0.5 (pnorm scale qnorm(0.5)=0), eta = 0.5 (qnorm(0.5)=0).
+# Helper: pull a specific kernel output stream (1=Q, 2=PE, 3=alpha) for a single-kernel trend.
+apply_kernel_code <- function(kernel_pars, emc, code, subject = 1) {
+  dadm  <- emc[[1]]$data[[subject]]
+  model <- emc[[1]]$model()
+  trend <- model$trend
+  p_vector <- sampled_pars(emc)
+  if (!is.null(kernel_pars)) p_vector[names(p_vector) %in% names(kernel_pars)] <- kernel_pars
+  p_mat <- t(as.matrix(p_vector)); colnames(p_mat) <- names(p_vector)
+  out <- get_pars_oo(p_mat, dadm, model, return_kernel_matrix = TRUE, kernel_output_codes = code)
+  out[, grepl(paste0("^", names(trend$kernels)[1], "\\."), colnames(out)), drop = FALSE]
+}
+
+ph_cov  <- c(NA, 1, 0, 1, NA)
+ph_pars <- c('m.q0' = 0, 'm.alpha0' = qnorm(0.5), 'm.eta' = qnorm(0.5))
+
+# Stream 1: Q value (via the public apply_kernel, which returns stream 1)
+trend_ph <- make_trend(make_base('m', 'lin', make_kernel('covariate1', 'pearcehall')))
+emc      <- make_minimal_emc(trend_ph, covariate1 = ph_cov)
+expected_Q <- matrix(c(0, 0, 0.5, 0.125, 0.671875))
+all.equal(matrix(apply_kernel(ph_pars, emc)), expected_Q)
+test_that("pearcehall_Q_Rcpp", {
+  expect_equal(matrix(apply_kernel(ph_pars, emc)), expected_Q)
+})
+
+# Stream 2: prediction error, Stream 3: associability (learning rate used per trial)
+expected_PE    <- matrix(c(NA, 1, -0.5, 0.875, NA))
+expected_alpha <- matrix(c(0.5, 0.5, 0.75, 0.625, 0.75))
+test_that("pearcehall_PE_alpha_Rcpp", {
+  expect_equal(matrix(apply_kernel_code(ph_pars, emc, 2L)), expected_PE)
+  expect_equal(matrix(apply_kernel_code(ph_pars, emc, 3L)), expected_alpha)
+})
+
+
+# beta_binomial (Beta-Binomial ideal observer) ----------------------------
+# Beta(a0,b0) prior; posterior a_t = a0 + hits, b_t = b0 + misses, PREDICTED
+# before observing the current trial. NA covariate = no count update.
+# Streams: 1=mean a_t/(a_t+b_t), 2=mode, 3=Shannon surprise -log2(p(obs)).
+trend_bb <- make_trend(make_base('m', 'lin', make_kernel('covariate1', 'beta_binomial')))
+
+## uniform prior a0=b0=1 (exp scale log(1)=0); cov c(1,1,0,NA,1)
+bb_pars <- c('m.a0' = log(1), 'm.b0' = log(1))
+bb_cov  <- c(1, 1, 0, NA, 1)
+emc <- make_minimal_emc(trend_bb, covariate1 = bb_cov)
+expected_mean     <- matrix(c(0.5, 2/3, 0.75, 0.6, 0.6))
+expected_mode     <- matrix(c(0.5, 1, 1, 2/3, 2/3))
+expected_surprise <- matrix(c(1, log2(3/2), 2, NaN, -log2(0.6)))
+all.equal(matrix(apply_kernel(bb_pars, emc)), expected_mean)
+test_that("beta_binomial_mean_Rcpp", {
+  expect_equal(matrix(apply_kernel(bb_pars, emc)), expected_mean)
+})
+test_that("beta_binomial_mode_surprise_Rcpp", {
+  expect_equal(matrix(apply_kernel_code(bb_pars, emc, 2L)), expected_mode)
+  expect_equal(matrix(apply_kernel_code(bb_pars, emc, 3L)), expected_surprise)
+})
+
+## asymmetric prior a0=2, b0=8 (prior mean 0.2); all-reliable outcomes pull belief up
+bb_pars2 <- c('m.a0' = log(2), 'm.b0' = log(8))
+emc <- make_minimal_emc(trend_bb, covariate1 = c(1, 1, 1, 1, 1))
+expected_mean2 <- matrix(c(2/10, 3/11, 4/12, 5/13, 6/14))
+test_that("beta_binomial_asym_prior_Rcpp", {
+  expect_equal(matrix(apply_kernel(bb_pars2, emc)), expected_mean2)
+})
+
+## all-NA covariate: belief stays at the prior mean (0.5) throughout
+emc <- make_minimal_emc(trend_bb, covariate1 = rep(NA_real_, 5))
+test_that("beta_binomial_allNA_Rcpp", {
+  expect_equal(matrix(apply_kernel(bb_pars, emc)), matrix(rep(0.5, 5)))
+})
+
+
 # delta 2 kernel ----------------------------------------------------------
 # trend_delta2kernel <- make_trend(par_names = "m", cov_names = 'covariate1', kernels = 'delta2kernel', base='lin')
 # kernel_pars <- c('m.q0'=0.8, 'm.alphaFast'=qnorm(0.50), 'm.propSlow' = qnorm(0.10), 'm.dSwitch'=qnorm(0.1))
