@@ -19,6 +19,7 @@ KernelType to_kernel_type(const Rcpp::String& k) {
   if (k == "rescorlawagner")       return KernelType::RescorlaWagner;
   if (k == "delta_satlink_gamma_card") return KernelType::DeltaSatlinkGammaCard;
   if (k == "delta_satlink_gamma_card_expdecr") return KernelType::DeltaSatlinkGammaCardExpdecr;
+  if (k == "delta_satlink_gamma_card_ph") return KernelType::DeltaSatlinkGammaCardPh;
   if (k == "delta_expdecr") return KernelType::DeltaExpdecr;
   if (k == "rw_satlink_gamma_card") return KernelType::RwSatlinkGammaCard;
   if (k == "rw_satlink_gamma_card_ff") return KernelType::RwSatlinkGammaCardFf;
@@ -53,6 +54,7 @@ std::unique_ptr<BaseKernel> make_kernel(KernelType kt, SEXP custom_fun) {
   case KernelType::RescorlaWagner:     return std::unique_ptr<BaseKernel>(new RescorlaWagnerKernel());
   case KernelType::DeltaSatlinkGammaCard: return std::unique_ptr<BaseKernel>(new DeltaSatlinkGammaCardKernel());
   case KernelType::DeltaSatlinkGammaCardExpdecr: return std::unique_ptr<BaseKernel>(new DeltaSatlinkGammaCardExpdecrKernel());
+  case KernelType::DeltaSatlinkGammaCardPh: return std::unique_ptr<BaseKernel>(new DeltaSatlinkGammaCardPhKernel());
   case KernelType::DeltaExpdecr: return std::unique_ptr<BaseKernel>(new DeltaExpdecrKernel());
   case KernelType::RwSatlinkGammaCard: return std::unique_ptr<BaseKernel>(new RwSatlinkGammaCardKernel());
   case KernelType::RwSatlinkGammaCardFf: return std::unique_ptr<BaseKernel>(new RwSatlinkGammaCardFfKernel());

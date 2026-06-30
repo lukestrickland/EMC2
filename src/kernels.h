@@ -75,6 +75,7 @@ enum class KernelType {
   RescorlaWagner,
   DeltaSatlinkGammaCard,
   DeltaSatlinkGammaCardExpdecr,
+  DeltaSatlinkGammaCardPh,
   DeltaExpdecr,
   RwSatlinkGammaCard,
   RwSatlinkGammaCardFf,
@@ -114,6 +115,7 @@ inline KernelMeta kernel_meta(KernelType kt) {
   case KernelType::RescorlaWagner: return{-1, false};  // N columns allowed
   case KernelType::DeltaSatlinkGammaCard:
   case KernelType::DeltaSatlinkGammaCardExpdecr:
+  case KernelType::DeltaSatlinkGammaCardPh:
   case KernelType::RwSatlinkGammaCard:
   case KernelType::RwSatlinkGammaCardFf:
   case KernelType::RwSatlinkGammaCardPh:
@@ -2201,6 +2203,244 @@ public:
   std::string output_stream_name(int code) const override {
     if (code == 1) return "AllocShape";
     throw std::runtime_error("DeltaSatlinkGammaCardExpdecrKernel::output_stream_name: unsupported code");
+  }
+};
+
+
+// =============================================================================
+// DeltaSatlinkGammaCardPhKernel — CARDINALITY-saturation satlink read-out with an
+// INDEPENDENT-prediction-error PEARCE-HALL dynamic learning rate.
+// = DeltaSatlinkGammaCardKernel (per-feature independent delta + cardsat read-out)
+// but the FIXED rate alpha is replaced by a per-cue PEARCE-HALL associability that
+// tracks THAT cue's OWN surprise. Unlike RwSatlinkGammaCardPhKernel (one summed
+// compound PE shared across the chosen option's cues), here each active cue e uses
+// its OWN prediction error pe_e = reward_e - q[e] for BOTH updates:
+//   q[e]     += assoc[e] * pe_e               // value update at the cue's rate
+//   assoc[e]  = eta*|pe_e| + (1-eta)*assoc[e] // associability relaxes toward |pe_e|
+// assoc IS the learning rate, clamped to [0,1]; alpha0 = initial associability,
+// eta = mixing weight. Inactive cues (NA covariate) carry q AND assoc forward. Same
+// cardsat geometry/read-out as DeltaSatlinkGammaCard: NO 3rd cue; a configural
+// channel passing only feat_*_1 is always sat_single. eta -> 0 nests the constant
+// independent-delta rate alpha0. q0 = plogis, alpha0/eta = pnorm in (0,1),
+// sat_*/gamma = exp. Parameters: q0, alpha0, eta, sat_single, sat_double, gamma.
+// =============================================================================
+struct DeltaSatlinkGammaCardPhKernel : SequentialKernel {
+private:
+  int n_elem_ = 0;
+  int n_covs_ = 0;
+
+  const int* q_reset_ = nullptr;
+  const int* feat_one_1_idx_ = nullptr;
+  const int* feat_one_2_idx_ = nullptr;
+  const int* feat_two_1_idx_ = nullptr;
+  const int* feat_two_2_idx_ = nullptr;
+  int arg_n_elem_ = -1;
+
+  // Compressed [n_comp x n_elem_] allocation shape, row-major: [g, -g, 0, ...]
+  std::vector<double> q_mat_;
+
+  // Identical to DeltaSatlinkGammaCardKernel::sat_link.
+  static double sat_link(double d, double theta, double gamma) {
+    double dpow = d;
+    if (!is_nan(gamma) && gamma > 0.0 && gamma != 1.0) {
+      const double ad = std::fabs(d);
+      dpow = (d < 0.0 ? -1.0 : 1.0) * std::pow(ad, gamma);
+    }
+    if (is_nan(theta) || theta <= 0.0) return dpow;
+    if (theta > 1e6) return dpow;     // saturation off; avoid 0*inf overflow
+    return theta * std::tanh(dpow / theta);
+  }
+
+  int required_feat_index(const int* arr, int row, const char* arg_name) const {
+    if (!arr) {
+      Rcpp::stop("DeltaSatlinkGammaCardPhKernel requires kernel_args$%s", arg_name);
+    }
+    const int value = arr[row];
+    if (value == NA_INTEGER || value <= 0) {
+      Rcpp::stop("DeltaSatlinkGammaCardPhKernel requires kernel_args$%s[%d] to be a positive 1-based elemental index",
+                 arg_name, row + 1);
+    }
+    const int idx = value - 1;
+    if (idx < 0 || idx >= n_elem_) {
+      Rcpp::stop("DeltaSatlinkGammaCardPhKernel kernel_args$%s[%d]=%d is outside 1:n_elem (%d)",
+                 arg_name, row + 1, value, n_elem_);
+    }
+    return idx;
+  }
+
+  int optional_feat_index(const int* arr, int row, const char* arg_name) const {
+    if (!arr) return -1;
+    const int value = arr[row];
+    if (value == NA_INTEGER || value <= 0) return -1;
+    const int idx = value - 1;
+    if (idx < 0 || idx >= n_elem_) {
+      Rcpp::stop("DeltaSatlinkGammaCardPhKernel kernel_args$%s[%d]=%d is outside 1:n_elem (%d)",
+                 arg_name, row + 1, value, n_elem_);
+    }
+    return idx;
+  }
+
+  void emit_row(int j, int r,
+                const double* sat_single_col, const double* sat_double_col,
+                const double* gamma_col,
+                const std::vector<double>& q) {
+    const int i11 = required_feat_index(feat_one_1_idx_, r, "feat_one_1_idx_column");
+    const int i12 = optional_feat_index(feat_one_2_idx_, r, "feat_one_2_idx_column");
+    const int i21 = required_feat_index(feat_two_1_idx_, r, "feat_two_1_idx_column");
+    const int i22 = optional_feat_index(feat_two_2_idx_, r, "feat_two_2_idx_column");
+
+    const double q11 = q[i11];
+    const double q12 = (i12 >= 0) ? q[i12] : 0.0;
+    const double q21 = q[i21];
+    const double q22 = (i22 >= 0) ? q[i22] : 0.0;
+
+    const double d = (q11 + q12) - (q21 + q22);
+
+    const bool two_item = (i12 >= 0) || (i22 >= 0);
+    const double sat = two_item ? sat_double_col[r] : sat_single_col[r];
+    const double g = sat_link(d, sat, gamma_col[r]);
+
+    double* row_out = &q_mat_[j * n_elem_];
+    row_out[0] =  g;
+    row_out[1] = -g;
+    for (int c = 2; c < n_elem_; ++c) row_out[c] = 0.0;
+  }
+
+public:
+  void set_kernel_args(const KernelArgs& args) override {
+    q_reset_ = args.q_reset;
+    feat_one_1_idx_ = args.feat_one_1_idx;
+    feat_one_2_idx_ = args.feat_one_2_idx;
+    feat_two_1_idx_ = args.feat_two_1_idx;
+    feat_two_2_idx_ = args.feat_two_2_idx;
+    arg_n_elem_ = args.n_elem;
+  }
+
+  void reset() override {
+    BaseKernel::reset();
+    q_mat_.clear();
+    n_elem_ = 0;
+    n_covs_ = 0;
+  }
+
+  void run(const KernelParsView& kernel_pars,
+           const Mat& covariate,
+           const std::vector<int>& comp_idx) override {
+             if (kernel_pars.cols.size() != 6) {
+               Rcpp::stop("DeltaSatlinkGammaCardPhKernel expects 6 parameter columns (q0, alpha0, eta, sat_single, sat_double, gamma), got %d",
+                          (int)kernel_pars.cols.size());
+             }
+
+             const int n_comp = static_cast<int>(comp_idx.size());
+             n_covs_ = covariate.ncol;
+             n_elem_ = arg_n_elem_;
+
+             if (n_comp == 0 || n_covs_ == 0) {
+               q_mat_.clear();
+               mark_run_complete();
+               return;
+             }
+
+             if (n_elem_ < 2) {
+               Rcpp::stop("DeltaSatlinkGammaCardPhKernel requires kernel_args$n_elem >= 2 to form a directional difference; got n_elem=%d",
+                          n_elem_);
+             }
+             if (n_covs_ != n_elem_) {
+               Rcpp::stop("DeltaSatlinkGammaCardPhKernel requires the number of covariate columns (%d) to equal kernel_args$n_elem (%d)",
+                          n_covs_, n_elem_);
+             }
+             if (!feat_one_1_idx_ || !feat_two_1_idx_) {
+               Rcpp::stop("DeltaSatlinkGammaCardPhKernel requires kernel_args$feat_one_1_idx_column and kernel_args$feat_two_1_idx_column");
+             }
+
+             const double* q0_col         = kernel_pars.cols[0];
+             const double* alpha0_col     = kernel_pars.cols[1];
+             const double* eta_col        = kernel_pars.cols[2];
+             const double* sat_single_col = kernel_pars.cols[3];
+             const double* sat_double_col = kernel_pars.cols[4];
+             const double* gamma_col      = kernel_pars.cols[5];
+
+             const int row0 = comp_idx[0];
+             std::vector<double> q(n_elem_, q0_col[row0]);
+             std::vector<double> assoc(n_elem_, alpha0_col[row0]);  // per-cue associability (PH rate)
+             q_mat_.assign(n_comp * n_elem_, 0.0);
+
+             emit_row(0, row0, sat_single_col, sat_double_col, gamma_col, q);
+
+             for (int j = 0; j < n_comp - 1; ++j) {
+               const int r = comp_idx[j];
+
+               if (q_reset_ && q_reset_[r] == 1) {
+                 std::fill(q.begin(), q.end(), q0_col[r]);
+                 std::fill(assoc.begin(), assoc.end(), alpha0_col[r]);  // reset associability too
+                 emit_row(j, r, sat_single_col, sat_double_col, gamma_col, q);
+               }
+
+               // INDEPENDENT per-cue prediction error: each active (non-NA cov) cue e uses
+               // its OWN pe_e = reward_e - q[e] for the value update AND the Pearce-Hall
+               // associability relaxation. No shared/summed compound PE (that is the RW
+               // variant). assoc[e] IS the learning rate, so it is clamped to [0,1].
+               double eta = eta_col[r];
+               if (is_nan(eta)) eta = 0.0;
+               if (eta < 0.0) eta = 0.0;
+               if (eta > 1.0) eta = 1.0;
+               for (int e = 0; e < n_elem_; ++e) {
+                 const double x = covariate(r, e);
+                 if (!is_nan(x)) {
+                   const double pe = x - q[e];
+                   q[e] += assoc[e] * pe;                  // rate = current associability
+                   double a = eta * std::fabs(pe) + (1.0 - eta) * assoc[e];
+                   if (a < 0.0) a = 0.0;
+                   if (a > 1.0) a = 1.0;                   // clamp: assoc IS the LR -> keep in [0,1]
+                   assoc[e] = a;
+                 }
+               }
+
+               const int next_r = comp_idx[j + 1];
+               emit_row(j + 1, next_r, sat_single_col, sat_double_col, gamma_col, q);
+             }
+
+             mark_run_complete();
+           }
+
+  KernelOutput get_output_stream(int code) const override {
+    if (code != 1) {
+      Rcpp::stop("DeltaSatlinkGammaCardPhKernel::get_output_stream: unsupported code %d (1=AllocShape)", code);
+    }
+
+    if (n_elem_ <= 0) return KernelOutput{ q_mat_.data(), 0, 0 };
+
+    const int n_comp = static_cast<int>(q_mat_.size()) / n_elem_;
+    std::vector<double>& buf = stream_buf_[0];
+
+    if (has_expand_idx_) {
+      const int n_full = static_cast<int>(expand_idx_.size());
+      buf.resize(n_full * n_elem_);
+
+      for (int c = 0; c < n_elem_; ++c) {
+        for (int i = 0; i < n_full; ++i) {
+          int comp_row = expand_idx_[i] - 1;
+          buf[c * n_full + i] = q_mat_[comp_row * n_elem_ + c];
+        }
+      }
+
+      return KernelOutput{ buf.data(), n_full, n_elem_ };
+    }
+
+    buf.resize(n_comp * n_elem_);
+
+    for (int c = 0; c < n_elem_; ++c) {
+      for (int r = 0; r < n_comp; ++r) {
+        buf[c * n_comp + r] = q_mat_[r * n_elem_ + c];
+      }
+    }
+
+    return KernelOutput{ buf.data(), n_comp, n_elem_ };
+  }
+
+  std::string output_stream_name(int code) const override {
+    if (code == 1) return "AllocShape";
+    throw std::runtime_error("DeltaSatlinkGammaCardPhKernel::output_stream_name: unsupported code");
   }
 };
 

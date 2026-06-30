@@ -1112,6 +1112,32 @@ get_kernels <- function() {
               sequential   = TRUE,
               n_outputs    = 1L,
               NA_allowed=TRUE),
+  delta_satlink_gamma_card_ph = list(description = paste(
+                "Cardinality-saturation satlink read-out (delta) with an INDEPENDENT-PE\n",
+                "         PEARCE-HALL dynamic learning rate. = delta_satlink_gamma_card but the\n",
+                "         FIXED rate alpha is replaced by a per-cue associability tracking that\n",
+                "         cue's OWN surprise (NOT the shared/summed compound PE of\n",
+                "         rw_satlink_gamma_card_ph): for each active cue e, pe_e = reward_e - q[e],\n",
+                "         q[e] += assoc[e]*pe_e, assoc[e] = eta*|pe_e| + (1-eta)*assoc[e] (clamped\n",
+                "         to [0,1] since assoc IS the rate). Same cardsat geometry/read-out (per-\n",
+                "         feature delta, directional D, cardinality-selected sat, AllocShape\n",
+                "         [g, -g, 0, ...]); a configural channel passing only feat_*_1 is always\n",
+                "         sat_single. eta -> 0 nests the constant-rate delta_satlink_gamma_card.\n",
+                "         Requires kernel_args: n_elem, feat_one_1_idx_column, feat_two_1_idx_column\n",
+                "         (+ optional feat_one_2/feat_two_2 + q_reset_column).\n",
+                "         Parameters: q0, alpha0 (initial associability), eta (associability mixing\n",
+                "         weight), sat_single, sat_double, gamma."
+              ),
+              default_pars = c("q0", "alpha0", "eta", "sat_single", "sat_double", "gamma"),
+              # q0 = plogis (matches delta_satlink_gamma_card / delta_plogis_q0 for by-name sharing);
+              # alpha0, eta = pnorm -> in (0,1) like the reference Pearce-Hall kernel.
+              transforms = list(func = list("q0" = "plogis", "alpha0" = "pnorm", "eta" = "pnorm",
+                                            "sat_single" = "exp", "sat_double" = "exp",
+                                            "gamma" = "exp")),
+              bases = base_2p,
+              sequential   = TRUE,
+              n_outputs    = 1L,
+              NA_allowed=TRUE),
   delta_expdecr = list(description = paste(
                 "Standard delta rule with an EXP-DECREASING learning rate + plogis-bounded q0.\n",
                 "         alpha_eff(t) = Phi(alpha_base + alpha_w * exp(-d_alpha_ed * block_trial)),\n",
