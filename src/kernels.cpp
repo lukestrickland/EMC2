@@ -22,6 +22,8 @@ KernelType to_kernel_type(const Rcpp::String& k) {
   if (k == "delta_expdecr") return KernelType::DeltaExpdecr;
   if (k == "rw_satlink_gamma_card") return KernelType::RwSatlinkGammaCard;
   if (k == "rw_satlink_gamma_card_ff") return KernelType::RwSatlinkGammaCardFf;
+  if (k == "rw_satlink_gamma_card_ph") return KernelType::RwSatlinkGammaCardPh;
+  if (k == "rw_satlink_gamma_card_expdecr") return KernelType::RwSatlinkGammaCardExpdecr;
   if (k == "beta_binomial")       return KernelType::BetaBinomial;
   if (k == "beta_binomial_decay") return KernelType::BetaBinomialDecay;
   if (k == "beta_binomial_window")return KernelType::BetaBinomialWindow;
@@ -54,6 +56,8 @@ std::unique_ptr<BaseKernel> make_kernel(KernelType kt, SEXP custom_fun) {
   case KernelType::DeltaExpdecr: return std::unique_ptr<BaseKernel>(new DeltaExpdecrKernel());
   case KernelType::RwSatlinkGammaCard: return std::unique_ptr<BaseKernel>(new RwSatlinkGammaCardKernel());
   case KernelType::RwSatlinkGammaCardFf: return std::unique_ptr<BaseKernel>(new RwSatlinkGammaCardFfKernel());
+  case KernelType::RwSatlinkGammaCardPh: return std::unique_ptr<BaseKernel>(new RwSatlinkGammaCardPhKernel());
+  case KernelType::RwSatlinkGammaCardExpdecr: return std::unique_ptr<BaseKernel>(new RwSatlinkGammaCardExpdecrKernel());
   case KernelType::BetaBinomial:       return std::make_unique<BetaBinomialKernel>();
   case KernelType::BetaBinomialDecay:  return std::make_unique<BetaBinomialDecayKernel>();
   case KernelType::BetaBinomialWindow: return std::make_unique<BetaBinomialWindowKernel>();
