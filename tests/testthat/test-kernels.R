@@ -231,6 +231,29 @@ test_that("beta_binomial_allNA_Rcpp", {
 })
 
 
+# beta_binomial_muvar (mean/variance-parameterised prior) -----------------
+# mu = 0.9 (identity), phi = 0.5 (pnorm scale qnorm(0.5)=0)  ->  kappa=(1-.5)/.5=1,
+# a0 = mu*kappa = 0.9, b0 = (1-mu)*kappa = 0.1. So it must match a Beta(0.9, 0.1)
+# prior updated by the same counts. cov c(1,1,0,NA,1):
+#   0.9/1.0, 1.9/2.0, 2.9/3.0, 2.9/4.0, 2.9/4.0
+trend_bbmv <- make_trend(make_base('m', 'lin', make_kernel('covariate1', 'beta_binomial_muvar')))
+bbmv_pars  <- c('m.mu' = 0.9, 'm.phi' = qnorm(0.5))
+emc <- make_minimal_emc(trend_bbmv, covariate1 = c(1, 1, 0, NA, 1))
+expected_mean <- matrix(c(0.9, 1.9/2, 2.9/3, 2.9/4, 2.9/4))
+all.equal(matrix(apply_kernel(bbmv_pars, emc)), expected_mean)
+test_that("beta_binomial_muvar_Rcpp", {
+  expect_equal(matrix(apply_kernel(bbmv_pars, emc)), expected_mean)
+})
+
+# cross-check: muvar(mu=0.9, phi=0.5) must equal beta_binomial(a0=0.9, b0=0.1)
+trend_bb_check <- make_trend(make_base('m', 'lin', make_kernel('covariate1', 'beta_binomial')))
+emc_bb <- make_minimal_emc(trend_bb_check, covariate1 = c(1, 1, 0, NA, 1))
+test_that("beta_binomial_muvar_matches_ab", {
+  expect_equal(matrix(apply_kernel(bbmv_pars, emc)),
+               matrix(apply_kernel(c('m.a0'=log(0.9), 'm.b0'=log(0.1)), emc_bb)))
+})
+
+
 # delta 2 kernel ----------------------------------------------------------
 # trend_delta2kernel <- make_trend(par_names = "m", cov_names = 'covariate1', kernels = 'delta2kernel', base='lin')
 # kernel_pars <- c('m.q0'=0.8, 'm.alphaFast'=qnorm(0.50), 'm.propSlow' = qnorm(0.10), 'm.dSwitch'=qnorm(0.1))

@@ -1111,6 +1111,23 @@ get_kernels <- function() {
     n_outputs    = 3L,
     experimental = FALSE,
     NA_allowed=TRUE),
+  beta_binomial_muvar = list(
+    description  = paste(
+      "Beta-Binomial ideal observer, mean/variance prior: k = E[p].\n",
+      "         Same update as beta_binomial, but the Beta(a0,b0) prior is set by its mean\n",
+      "         mu and normalised variance phi in (0,1): kappa=(1-phi)/phi, a0=mu*kappa,\n",
+      "         b0=(1-mu)*kappa, so prior var = mu*(1-mu)*phi. Fix mu (via constants) and\n",
+      "         estimate phi; a0/b0 alone are jointly non-identifiable.\n",
+      "         Parameters: mu (prior mean), phi (variance as fraction of its max mu*(1-mu)).\n",
+      "         Output streams: 1=mean, 2=mode, 3=Shannon surprise."
+    ),
+    default_pars = c("mu", "phi"),
+    transforms   = list(func = list("mu" = "identity", "phi" = "pnorm")),
+    bases        = base_2p,
+    sequential   = TRUE,
+    n_outputs    = 3L,
+    experimental = FALSE,
+    NA_allowed=TRUE),
   beta_binomial_decay = list(
     description  = "Beta-Binomial with exponential decay on accumulated counts.",
     default_pars = c("a0", "b0", "decay"),

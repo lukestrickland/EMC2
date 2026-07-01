@@ -58,6 +58,7 @@ enum class KernelType {
   Custom,
   RescorlaWagner,
   BetaBinomial,
+  BetaBinomialMuVar,
   BetaBinomialDecay,
   BetaBinomialWindow,
   DBM,
@@ -90,6 +91,7 @@ inline KernelMeta kernel_meta(KernelType kt) {
   case KernelType::Custom: return{1, false};
   case KernelType::RescorlaWagner: return{-1, false};  // N columns allowed
   case KernelType::BetaBinomial:
+  case KernelType::BetaBinomialMuVar:
   case KernelType::BetaBinomialDecay:
   case KernelType::BetaBinomialWindow:
   case KernelType::DBM:
@@ -1408,6 +1410,67 @@ struct BetaBinomialKernel : DBMBaseKernel {
                const int    r   = comp_idx[j];
                const double a_t = a0_col[r] + n_hit;
                const double b_t = b0_col[r] + (n_trial - n_hit);
+
+               pred_mean_[j] = beta_mean(a_t, b_t);
+               pred_mode_[j] = beta_mode(a_t, b_t);
+
+               const double x = cov_ptr[r];
+               if (!is_nan(x)) { n_hit += x; n_trial += 1.0; }
+             }
+
+             store_obs(cov_ptr, comp_idx);
+             sync_out_to_mean();
+             mark_run_complete();
+           }
+};
+
+// =============================================================================
+// BetaBinomialMuVarKernel — Beta-Binomial with a mean/variance-parameterised prior.
+// Identical update to BetaBinomialKernel, but the Beta(a0,b0) prior is set by its
+// mean mu and normalised variance phi in (0,1):
+//   kappa = (1 - phi) / phi           (prior concentration = a0 + b0)
+//   a0 = mu * kappa ;  b0 = (1 - mu) * kappa
+//   => prior mean = mu,  prior variance = mu*(1-mu)*phi.
+// Fix mu (e.g. via `constants`) and estimate phi so the prior is identifiable
+// (a0/b0 are jointly non-identifiable). Parameters: mu, phi.
+// =============================================================================
+struct BetaBinomialMuVarKernel : DBMBaseKernel {
+  void run(const KernelParsView& kernel_pars,
+           const Mat& covariate,
+           const std::vector<int>& comp_idx) override {
+
+             if (kernel_pars.cols.size() != 2)
+               Rcpp::stop("BetaBinomialMuVarKernel expects 2 parameter columns (mu, phi), got %d",
+                          (int)kernel_pars.cols.size());
+
+             const int     n_comp  = static_cast<int>(comp_idx.size());
+             const double* mu_col  = kernel_pars.cols[0];
+             const double* phi_col = kernel_pars.cols[1];
+             const double* cov_ptr = covariate.colptr(0);
+
+             pred_mean_.resize(n_comp);
+             pred_mode_.resize(n_comp);
+
+             double n_hit = 0.0, n_trial = 0.0;
+             const double eps = 1e-9;
+
+             for (int j = 0; j < n_comp; ++j) {
+               const int r = comp_idx[j];
+
+               // (mu, phi) -> Beta(a0, b0); clamp off the open-interval endpoints.
+               double mu  = mu_col[r];
+               double phi = phi_col[r];
+               if (mu  < eps)        mu  = eps;
+               if (mu  > 1.0 - eps)  mu  = 1.0 - eps;
+               if (phi < eps)        phi = eps;
+               if (phi > 1.0 - eps)  phi = 1.0 - eps;
+
+               const double kappa = (1.0 - phi) / phi;   // prior concentration a0 + b0
+               const double a0 = mu * kappa;
+               const double b0 = (1.0 - mu) * kappa;
+
+               const double a_t = a0 + n_hit;
+               const double b_t = b0 + (n_trial - n_hit);
 
                pred_mean_[j] = beta_mean(a_t, b_t);
                pred_mode_[j] = beta_mode(a_t, b_t);
