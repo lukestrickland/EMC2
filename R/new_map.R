@@ -67,7 +67,8 @@ minimal_design <- function(design, covariates = NULL, drop_subjects = TRUE,
 
     ## 3. Add accumulators
     if(add_acc){
-      fac_df <- add_accumulators(fac_df, matchfun = cur_des$matchfun, type = cur_des$model()$type)
+      fac_df <- add_accumulators(fac_df, matchfun = cur_des$matchfun, type = cur_des$model()$type,
+                                 custom_expand = cur_des$model()$expand_accumulators)
     }
     if(!is.null(fac_df$R) & drop_R_levels){
       fac_df <- fac_df[fac_df$R == unique(fac_df$R)[1],]
@@ -336,7 +337,8 @@ par_data_map <- function(par_mcmc, design, n_trials = NULL, data = NULL,
 
   model <- design$model
   data <- design_model(
-    add_accumulators(data,design$matchfun,simulate=TRUE,type=model()$type,Fcovariates=design$Fcovariates),
+    add_accumulators(data,design$matchfun,simulate=TRUE,type=model()$type,Fcovariates=design$Fcovariates,
+                     custom_expand=model()$expand_accumulators),
     design,model,add_acc=FALSE,compress=FALSE,verbose=FALSE,
     rt_check=FALSE)
 

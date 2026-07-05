@@ -74,12 +74,19 @@ enum class KernelType {
   Custom,
   RescorlaWagner,
   DeltaSatlinkGammaCard,
+  DeltaSatlinkDimCard,
+  DeltaNoisyOrCard,
+  RwNoisyOrCard,
   DeltaSatlinkGammaCardExpdecr,
   DeltaExpdecr,
   RwSatlinkGammaCard,
   RwSatlinkGammaCardFf,
+  RwSatlinkGammaCard2ch,
+  RwSatlinkGammaCard2chFf,
   RwSatlinkGammaCardPh,
   RwSatlinkGammaCardExpdecr,
+  RwSatlinkDimCard,
+  RwSatlinkDimCardFf,
   BetaBinomial,
   BetaBinomialDecay,
   BetaBinomialWindow,
@@ -113,11 +120,18 @@ inline KernelMeta kernel_meta(KernelType kt) {
   case KernelType::Custom: return{1, false};
   case KernelType::RescorlaWagner: return{-1, false};  // N columns allowed
   case KernelType::DeltaSatlinkGammaCard:
+  case KernelType::DeltaSatlinkDimCard:
+  case KernelType::DeltaNoisyOrCard:
+  case KernelType::RwNoisyOrCard:
   case KernelType::DeltaSatlinkGammaCardExpdecr:
   case KernelType::RwSatlinkGammaCard:
   case KernelType::RwSatlinkGammaCardFf:
+  case KernelType::RwSatlinkGammaCard2ch:
+  case KernelType::RwSatlinkGammaCard2chFf:
   case KernelType::RwSatlinkGammaCardPh:
-  case KernelType::RwSatlinkGammaCardExpdecr: return{-1, false};  // variadic: all n_elem cols at once
+  case KernelType::RwSatlinkGammaCardExpdecr:
+  case KernelType::RwSatlinkDimCard:
+  case KernelType::RwSatlinkDimCardFf: return{-1, false};  // variadic: all n_elem cols at once
   case KernelType::BetaBinomial:
   case KernelType::BetaBinomialDecay:
   case KernelType::BetaBinomialWindow:
@@ -1961,6 +1975,619 @@ public:
 
 
 // =============================================================================
+// DeltaSatlinkDimCardKernel — PER-DIMENSION cardinality-saturation satlink.
+//
+// Identical learning + cardsat sat-selection to DeltaSatlinkGammaCardKernel, but the
+// read-out is applied PER FEATURE DIMENSION rather than to the summed option advantage:
+//   d1 = q_one1 - q_two1 ,  g1 = sat*tanh(d1^gamma/sat)   -> AllocShape column 0
+//   d2 = q_one2 - q_two2 ,  g2 = sat*tanh(d2^gamma/sat)   -> AllocShape column 1  (Double only)
+// This is the win-all / win-one read-out (route g1 to the dim-1 feature accumulators,
+// g2 to the dim-2 ones with a per-dimension coding map). sat is still chosen by trial
+// cardinality (Double -> sat_double, Single -> sat_single), so the sat parameters line
+// up 1:1 with the option-level cardsat champion. sat -> Inf nests linear per dimension.
+// =============================================================================
+struct DeltaSatlinkDimCardKernel : SequentialKernel {
+private:
+  int n_elem_ = 0;
+  int n_covs_ = 0;
+
+  const int* q_reset_ = nullptr;
+  const int* feat_one_1_idx_ = nullptr;
+  const int* feat_one_2_idx_ = nullptr;
+  const int* feat_two_1_idx_ = nullptr;
+  const int* feat_two_2_idx_ = nullptr;
+  int arg_n_elem_ = -1;
+
+  std::vector<double> q_mat_;   // [n_comp x n_elem_], row-major: [g1, g2, 0, ...]
+
+  static double sat_link(double d, double theta, double gamma) {
+    double dpow = d;
+    if (!is_nan(gamma) && gamma > 0.0 && gamma != 1.0) {
+      const double ad = std::fabs(d);
+      dpow = (d < 0.0 ? -1.0 : 1.0) * std::pow(ad, gamma);
+    }
+    if (is_nan(theta) || theta <= 0.0) return dpow;
+    if (theta > 1e6) return dpow;
+    return theta * std::tanh(dpow / theta);
+  }
+
+  int required_feat_index(const int* arr, int row, const char* arg_name) const {
+    if (!arr) Rcpp::stop("DeltaSatlinkDimCardKernel requires kernel_args$%s", arg_name);
+    const int value = arr[row];
+    if (value == NA_INTEGER || value <= 0)
+      Rcpp::stop("DeltaSatlinkDimCardKernel requires kernel_args$%s[%d] to be a positive 1-based elemental index",
+                 arg_name, row + 1);
+    const int idx = value - 1;
+    if (idx < 0 || idx >= n_elem_)
+      Rcpp::stop("DeltaSatlinkDimCardKernel kernel_args$%s[%d]=%d is outside 1:n_elem (%d)",
+                 arg_name, row + 1, value, n_elem_);
+    return idx;
+  }
+
+  int optional_feat_index(const int* arr, int row, const char* arg_name) const {
+    if (!arr) return -1;
+    const int value = arr[row];
+    if (value == NA_INTEGER || value <= 0) return -1;
+    const int idx = value - 1;
+    if (idx < 0 || idx >= n_elem_)
+      Rcpp::stop("DeltaSatlinkDimCardKernel kernel_args$%s[%d]=%d is outside 1:n_elem (%d)",
+                 arg_name, row + 1, value, n_elem_);
+    return idx;
+  }
+
+  void emit_row(int j, int r,
+                const double* sat_single_col, const double* sat_double_col,
+                const double* gamma_col,
+                const std::vector<double>& q) {
+    const int i11 = required_feat_index(feat_one_1_idx_, r, "feat_one_1_idx_column");
+    const int i12 = optional_feat_index(feat_one_2_idx_, r, "feat_one_2_idx_column");
+    const int i21 = required_feat_index(feat_two_1_idx_, r, "feat_two_1_idx_column");
+    const int i22 = optional_feat_index(feat_two_2_idx_, r, "feat_two_2_idx_column");
+
+    // Trial cardinality: a present second feature on either option -> Double -> sat_double.
+    const bool two_item = (i12 >= 0) || (i22 >= 0);
+    const double sat = two_item ? sat_double_col[r] : sat_single_col[r];
+    const double gam = gamma_col[r];
+
+    const double d1 = q[i11] - q[i21];              // dimension 1 advantage
+    const double g1 = sat_link(d1, sat, gam);
+    double g2 = 0.0;
+    if (i12 >= 0 && i22 >= 0) {                      // dimension 2 present on both options
+      const double d2 = q[i12] - q[i22];
+      g2 = sat_link(d2, sat, gam);
+    }
+
+    double* row_out = &q_mat_[j * n_elem_];
+    row_out[0] = g1;   // routed to opt1_f1(+) / opt2_f1(-)
+    row_out[1] = g2;   // routed to opt1_f2(+) / opt2_f2(-)
+    for (int c = 2; c < n_elem_; ++c) row_out[c] = 0.0;
+  }
+
+public:
+  void set_kernel_args(const KernelArgs& args) override {
+    q_reset_ = args.q_reset;
+    feat_one_1_idx_ = args.feat_one_1_idx;
+    feat_one_2_idx_ = args.feat_one_2_idx;
+    feat_two_1_idx_ = args.feat_two_1_idx;
+    feat_two_2_idx_ = args.feat_two_2_idx;
+    arg_n_elem_ = args.n_elem;
+  }
+
+  void reset() override {
+    BaseKernel::reset();
+    q_mat_.clear();
+    n_elem_ = 0;
+    n_covs_ = 0;
+  }
+
+  void run(const KernelParsView& kernel_pars,
+           const Mat& covariate,
+           const std::vector<int>& comp_idx) override {
+             if (kernel_pars.cols.size() != 5) {
+               Rcpp::stop("DeltaSatlinkDimCardKernel expects 5 parameter columns (q0, alpha, sat_single, sat_double, gamma), got %d",
+                          (int)kernel_pars.cols.size());
+             }
+             const int n_comp = static_cast<int>(comp_idx.size());
+             n_covs_ = covariate.ncol;
+             n_elem_ = arg_n_elem_;
+
+             if (n_comp == 0 || n_covs_ == 0) { q_mat_.clear(); mark_run_complete(); return; }
+
+             if (n_elem_ < 2)
+               Rcpp::stop("DeltaSatlinkDimCardKernel requires kernel_args$n_elem >= 2; got n_elem=%d", n_elem_);
+             if (n_covs_ != n_elem_)
+               Rcpp::stop("DeltaSatlinkDimCardKernel requires covariate columns (%d) to equal kernel_args$n_elem (%d)",
+                          n_covs_, n_elem_);
+             if (!feat_one_1_idx_ || !feat_two_1_idx_)
+               Rcpp::stop("DeltaSatlinkDimCardKernel requires kernel_args$feat_one_1_idx_column and kernel_args$feat_two_1_idx_column");
+
+             const double* q0_col         = kernel_pars.cols[0];
+             const double* alpha_col      = kernel_pars.cols[1];
+             const double* sat_single_col = kernel_pars.cols[2];
+             const double* sat_double_col = kernel_pars.cols[3];
+             const double* gamma_col      = kernel_pars.cols[4];
+
+             const int row0 = comp_idx[0];
+             std::vector<double> q(n_elem_, q0_col[row0]);
+             q_mat_.assign(n_comp * n_elem_, 0.0);
+
+             emit_row(0, row0, sat_single_col, sat_double_col, gamma_col, q);
+
+             for (int j = 0; j < n_comp - 1; ++j) {
+               const int r = comp_idx[j];
+               if (q_reset_ && q_reset_[r] == 1) {
+                 std::fill(q.begin(), q.end(), q0_col[r]);
+                 emit_row(j, r, sat_single_col, sat_double_col, gamma_col, q);
+               }
+               const double alpha = alpha_col[r];
+               for (int e = 0; e < n_elem_; ++e) {
+                 const double x = covariate(r, e);
+                 if (!is_nan(x)) q[e] += alpha * (x - q[e]);
+               }
+               const int next_r = comp_idx[j + 1];
+               emit_row(j + 1, next_r, sat_single_col, sat_double_col, gamma_col, q);
+             }
+             mark_run_complete();
+           }
+
+  KernelOutput get_output_stream(int code) const override {
+    if (code != 1)
+      Rcpp::stop("DeltaSatlinkDimCardKernel::get_output_stream: unsupported code %d (1=AllocShape)", code);
+    if (n_elem_ <= 0) return KernelOutput{ q_mat_.data(), 0, 0 };
+
+    const int n_comp = static_cast<int>(q_mat_.size()) / n_elem_;
+    std::vector<double>& buf = stream_buf_[0];
+
+    if (has_expand_idx_) {
+      const int n_full = static_cast<int>(expand_idx_.size());
+      buf.resize(n_full * n_elem_);
+      for (int c = 0; c < n_elem_; ++c)
+        for (int i = 0; i < n_full; ++i) {
+          int comp_row = expand_idx_[i] - 1;
+          buf[c * n_full + i] = q_mat_[comp_row * n_elem_ + c];
+        }
+      return KernelOutput{ buf.data(), n_full, n_elem_ };
+    }
+
+    buf.resize(n_comp * n_elem_);
+    for (int c = 0; c < n_elem_; ++c)
+      for (int r = 0; r < n_comp; ++r)
+        buf[c * n_comp + r] = q_mat_[r * n_elem_ + c];
+    return KernelOutput{ buf.data(), n_comp, n_elem_ };
+  }
+
+  std::string output_stream_name(int code) const override {
+    if (code == 1) return "AllocShape";
+    throw std::runtime_error("DeltaSatlinkDimCardKernel::output_stream_name: unsupported code");
+  }
+};
+
+
+// =============================================================================
+// DeltaNoisyOrCardKernel -- option-level noisy-OR elemental read-out (delta).
+//
+// Identical independent elemental delta learning and cardinality-saturation
+// machinery to DeltaSatlinkGammaCardKernel, but the option values are composed
+// from elemental Qs with a noisy-OR:
+//   V_one = 1 - prod_i(1 - q_one_i)
+//   V_two = 1 - prod_i(1 - q_two_i)
+//   D = V_one - V_two
+// This is a causal-compositional elemental observer: it does not learn compound
+// Q states, but it emits an option-level advantage [g, -g, 0, ...] that can be
+// routed team-wide in a win-all race. Parameters: q0, alpha, sat_single,
+// sat_double, gamma.
+// =============================================================================
+struct DeltaNoisyOrCardKernel : SequentialKernel {
+private:
+  int n_elem_ = 0;
+  int n_covs_ = 0;
+
+  const int* q_reset_ = nullptr;
+  const int* feat_one_1_idx_ = nullptr;
+  const int* feat_one_2_idx_ = nullptr;
+  const int* feat_two_1_idx_ = nullptr;
+  const int* feat_two_2_idx_ = nullptr;
+  int arg_n_elem_ = -1;
+
+  std::vector<double> q_mat_;
+
+  static double sat_link(double d, double theta, double gamma) {
+    double dpow = d;
+    if (!is_nan(gamma) && gamma > 0.0 && gamma != 1.0) {
+      const double ad = std::fabs(d);
+      dpow = (d < 0.0 ? -1.0 : 1.0) * std::pow(ad, gamma);
+    }
+    if (is_nan(theta) || theta <= 0.0) return dpow;
+    if (theta > 1e6) return dpow;
+    return theta * std::tanh(dpow / theta);
+  }
+
+  static double noisy_or_value(double q1, int idx2, const std::vector<double>& q) {
+    if (idx2 < 0) return q1;
+    const double q2 = q[idx2];
+    return 1.0 - (1.0 - q1) * (1.0 - q2);
+  }
+
+  int required_feat_index(const int* arr, int row, const char* arg_name) const {
+    if (!arr) Rcpp::stop("DeltaNoisyOrCardKernel requires kernel_args$%s", arg_name);
+    const int value = arr[row];
+    if (value == NA_INTEGER || value <= 0)
+      Rcpp::stop("DeltaNoisyOrCardKernel requires kernel_args$%s[%d] to be a positive 1-based elemental index",
+                 arg_name, row + 1);
+    const int idx = value - 1;
+    if (idx < 0 || idx >= n_elem_)
+      Rcpp::stop("DeltaNoisyOrCardKernel kernel_args$%s[%d]=%d is outside 1:n_elem (%d)",
+                 arg_name, row + 1, value, n_elem_);
+    return idx;
+  }
+
+  int optional_feat_index(const int* arr, int row, const char* arg_name) const {
+    if (!arr) return -1;
+    const int value = arr[row];
+    if (value == NA_INTEGER || value <= 0) return -1;
+    const int idx = value - 1;
+    if (idx < 0 || idx >= n_elem_)
+      Rcpp::stop("DeltaNoisyOrCardKernel kernel_args$%s[%d]=%d is outside 1:n_elem (%d)",
+                 arg_name, row + 1, value, n_elem_);
+    return idx;
+  }
+
+  void emit_row(int j, int r,
+                const double* sat_single_col, const double* sat_double_col,
+                const double* gamma_col,
+                const std::vector<double>& q) {
+    const int i11 = required_feat_index(feat_one_1_idx_, r, "feat_one_1_idx_column");
+    const int i12 = optional_feat_index(feat_one_2_idx_, r, "feat_one_2_idx_column");
+    const int i21 = required_feat_index(feat_two_1_idx_, r, "feat_two_1_idx_column");
+    const int i22 = optional_feat_index(feat_two_2_idx_, r, "feat_two_2_idx_column");
+
+    const double v_one = noisy_or_value(q[i11], i12, q);
+    const double v_two = noisy_or_value(q[i21], i22, q);
+    const double d = v_one - v_two;
+
+    const bool two_item = (i12 >= 0) || (i22 >= 0);
+    const double sat = two_item ? sat_double_col[r] : sat_single_col[r];
+    const double g = sat_link(d, sat, gamma_col[r]);
+
+    double* row_out = &q_mat_[j * n_elem_];
+    row_out[0] =  g;
+    row_out[1] = -g;
+    for (int c = 2; c < n_elem_; ++c) row_out[c] = 0.0;
+  }
+
+public:
+  void set_kernel_args(const KernelArgs& args) override {
+    q_reset_ = args.q_reset;
+    feat_one_1_idx_ = args.feat_one_1_idx;
+    feat_one_2_idx_ = args.feat_one_2_idx;
+    feat_two_1_idx_ = args.feat_two_1_idx;
+    feat_two_2_idx_ = args.feat_two_2_idx;
+    arg_n_elem_ = args.n_elem;
+  }
+
+  void reset() override {
+    BaseKernel::reset();
+    q_mat_.clear();
+    n_elem_ = 0;
+    n_covs_ = 0;
+  }
+
+  void run(const KernelParsView& kernel_pars,
+           const Mat& covariate,
+           const std::vector<int>& comp_idx) override {
+             if (kernel_pars.cols.size() != 5) {
+               Rcpp::stop("DeltaNoisyOrCardKernel expects 5 parameter columns (q0, alpha, sat_single, sat_double, gamma), got %d",
+                          (int)kernel_pars.cols.size());
+             }
+             const int n_comp = static_cast<int>(comp_idx.size());
+             n_covs_ = covariate.ncol;
+             n_elem_ = arg_n_elem_;
+
+             if (n_comp == 0 || n_covs_ == 0) { q_mat_.clear(); mark_run_complete(); return; }
+
+             if (n_elem_ < 2)
+               Rcpp::stop("DeltaNoisyOrCardKernel requires kernel_args$n_elem >= 2; got n_elem=%d", n_elem_);
+             if (n_covs_ != n_elem_)
+               Rcpp::stop("DeltaNoisyOrCardKernel requires covariate columns (%d) to equal kernel_args$n_elem (%d)",
+                          n_covs_, n_elem_);
+             if (!feat_one_1_idx_ || !feat_two_1_idx_)
+               Rcpp::stop("DeltaNoisyOrCardKernel requires kernel_args$feat_one_1_idx_column and kernel_args$feat_two_1_idx_column");
+
+             const double* q0_col         = kernel_pars.cols[0];
+             const double* alpha_col      = kernel_pars.cols[1];
+             const double* sat_single_col = kernel_pars.cols[2];
+             const double* sat_double_col = kernel_pars.cols[3];
+             const double* gamma_col      = kernel_pars.cols[4];
+
+             const int row0 = comp_idx[0];
+             std::vector<double> q(n_elem_, q0_col[row0]);
+             q_mat_.assign(n_comp * n_elem_, 0.0);
+
+             emit_row(0, row0, sat_single_col, sat_double_col, gamma_col, q);
+
+             for (int j = 0; j < n_comp - 1; ++j) {
+               const int r = comp_idx[j];
+               if (q_reset_ && q_reset_[r] == 1) {
+                 std::fill(q.begin(), q.end(), q0_col[r]);
+                 emit_row(j, r, sat_single_col, sat_double_col, gamma_col, q);
+               }
+               const double alpha = alpha_col[r];
+               for (int e = 0; e < n_elem_; ++e) {
+                 const double x = covariate(r, e);
+                 if (!is_nan(x)) q[e] += alpha * (x - q[e]);
+               }
+               const int next_r = comp_idx[j + 1];
+               emit_row(j + 1, next_r, sat_single_col, sat_double_col, gamma_col, q);
+             }
+             mark_run_complete();
+           }
+
+  KernelOutput get_output_stream(int code) const override {
+    if (code != 1)
+      Rcpp::stop("DeltaNoisyOrCardKernel::get_output_stream: unsupported code %d (1=AllocShape)", code);
+    if (n_elem_ <= 0) return KernelOutput{ q_mat_.data(), 0, 0 };
+
+    const int n_comp = static_cast<int>(q_mat_.size()) / n_elem_;
+    std::vector<double>& buf = stream_buf_[0];
+
+    if (has_expand_idx_) {
+      const int n_full = static_cast<int>(expand_idx_.size());
+      buf.resize(n_full * n_elem_);
+      for (int c = 0; c < n_elem_; ++c)
+        for (int i = 0; i < n_full; ++i) {
+          int comp_row = expand_idx_[i] - 1;
+          buf[c * n_full + i] = q_mat_[comp_row * n_elem_ + c];
+        }
+      return KernelOutput{ buf.data(), n_full, n_elem_ };
+    }
+
+    buf.resize(n_comp * n_elem_);
+    for (int c = 0; c < n_elem_; ++c)
+      for (int r = 0; r < n_comp; ++r)
+        buf[c * n_comp + r] = q_mat_[r * n_elem_ + c];
+    return KernelOutput{ buf.data(), n_comp, n_elem_ };
+  }
+
+  std::string output_stream_name(int code) const override {
+    if (code == 1) return "AllocShape";
+    throw std::runtime_error("DeltaNoisyOrCardKernel::output_stream_name: unsupported code");
+  }
+};
+
+
+// =============================================================================
+// RwNoisyOrCardKernel -- noisy-OR read-out with GRADIENT (shared-PE) learning
+// through the OR link: the causal-power learner.
+//
+// Identical read-out and plumbing to DeltaNoisyOrCardKernel (option values
+// composed as V = 1 - prod(1 - q), advantage D = V_one - V_two, cardinality
+// saturation, AllocShape [g, -g, 0, ...]), but the UPDATE is gradient descent
+// on the prediction error through the OR link over the chosen option's active
+// cues (the non-NA covariate entries; their shared non-NA value is the reward):
+//   V_chosen = 1 - prod_active(1 - q_e)
+//   pe       = reward - V_chosen                       (ONE shared error)
+//   q_e     += alpha * pe * prod_{f!=e, active}(1 - q_f)   (dV/dq_e)
+// The prod(1 - q_other) factor is EXPLAINING-AWAY: a strong partner absorbs
+// the outcome, so the cue's estimate barely moves. With each feature appearing
+// in two compounds this converges to the SOLO causal strengths (the task's
+// generative p1..p4), unlike the independent delta which converges to the
+// team-rate marginals. One active cue reduces exactly to the plain delta.
+// Q is clamped to [0,1] (the gradient step can overshoot; projected gradient).
+// Parameters: q0, alpha, sat_single, sat_double, gamma.
+// =============================================================================
+struct RwNoisyOrCardKernel : SequentialKernel {
+private:
+  int n_elem_ = 0;
+  int n_covs_ = 0;
+
+  const int* q_reset_ = nullptr;
+  const int* feat_one_1_idx_ = nullptr;
+  const int* feat_one_2_idx_ = nullptr;
+  const int* feat_two_1_idx_ = nullptr;
+  const int* feat_two_2_idx_ = nullptr;
+  int arg_n_elem_ = -1;
+
+  std::vector<double> q_mat_;
+
+  static double clamp01(double v) {
+    if (v < 0.0) return 0.0;
+    if (v > 1.0) return 1.0;
+    return v;
+  }
+
+  static double sat_link(double d, double theta, double gamma) {
+    double dpow = d;
+    if (!is_nan(gamma) && gamma > 0.0 && gamma != 1.0) {
+      const double ad = std::fabs(d);
+      dpow = (d < 0.0 ? -1.0 : 1.0) * std::pow(ad, gamma);
+    }
+    if (is_nan(theta) || theta <= 0.0) return dpow;
+    if (theta > 1e6) return dpow;
+    return theta * std::tanh(dpow / theta);
+  }
+
+  static double noisy_or_value(double q1, int idx2, const std::vector<double>& q) {
+    if (idx2 < 0) return q1;
+    const double q2 = q[idx2];
+    return 1.0 - (1.0 - q1) * (1.0 - q2);
+  }
+
+  int required_feat_index(const int* arr, int row, const char* arg_name) const {
+    if (!arr) Rcpp::stop("RwNoisyOrCardKernel requires kernel_args$%s", arg_name);
+    const int value = arr[row];
+    if (value == NA_INTEGER || value <= 0)
+      Rcpp::stop("RwNoisyOrCardKernel requires kernel_args$%s[%d] to be a positive 1-based elemental index",
+                 arg_name, row + 1);
+    const int idx = value - 1;
+    if (idx < 0 || idx >= n_elem_)
+      Rcpp::stop("RwNoisyOrCardKernel kernel_args$%s[%d]=%d is outside 1:n_elem (%d)",
+                 arg_name, row + 1, value, n_elem_);
+    return idx;
+  }
+
+  int optional_feat_index(const int* arr, int row, const char* arg_name) const {
+    if (!arr) return -1;
+    const int value = arr[row];
+    if (value == NA_INTEGER || value <= 0) return -1;
+    const int idx = value - 1;
+    if (idx < 0 || idx >= n_elem_)
+      Rcpp::stop("RwNoisyOrCardKernel kernel_args$%s[%d]=%d is outside 1:n_elem (%d)",
+                 arg_name, row + 1, value, n_elem_);
+    return idx;
+  }
+
+  void emit_row(int j, int r,
+                const double* sat_single_col, const double* sat_double_col,
+                const double* gamma_col,
+                const std::vector<double>& q) {
+    const int i11 = required_feat_index(feat_one_1_idx_, r, "feat_one_1_idx_column");
+    const int i12 = optional_feat_index(feat_one_2_idx_, r, "feat_one_2_idx_column");
+    const int i21 = required_feat_index(feat_two_1_idx_, r, "feat_two_1_idx_column");
+    const int i22 = optional_feat_index(feat_two_2_idx_, r, "feat_two_2_idx_column");
+
+    const double v_one = noisy_or_value(q[i11], i12, q);
+    const double v_two = noisy_or_value(q[i21], i22, q);
+    const double d = v_one - v_two;
+
+    const bool two_item = (i12 >= 0) || (i22 >= 0);
+    const double sat = two_item ? sat_double_col[r] : sat_single_col[r];
+    const double g = sat_link(d, sat, gamma_col[r]);
+
+    double* row_out = &q_mat_[j * n_elem_];
+    row_out[0] =  g;
+    row_out[1] = -g;
+    for (int c = 2; c < n_elem_; ++c) row_out[c] = 0.0;
+  }
+
+public:
+  void set_kernel_args(const KernelArgs& args) override {
+    q_reset_ = args.q_reset;
+    feat_one_1_idx_ = args.feat_one_1_idx;
+    feat_one_2_idx_ = args.feat_one_2_idx;
+    feat_two_1_idx_ = args.feat_two_1_idx;
+    feat_two_2_idx_ = args.feat_two_2_idx;
+    arg_n_elem_ = args.n_elem;
+  }
+
+  void reset() override {
+    BaseKernel::reset();
+    q_mat_.clear();
+    n_elem_ = 0;
+    n_covs_ = 0;
+  }
+
+  void run(const KernelParsView& kernel_pars,
+           const Mat& covariate,
+           const std::vector<int>& comp_idx) override {
+             if (kernel_pars.cols.size() != 5) {
+               Rcpp::stop("RwNoisyOrCardKernel expects 5 parameter columns (q0, alpha, sat_single, sat_double, gamma), got %d",
+                          (int)kernel_pars.cols.size());
+             }
+             const int n_comp = static_cast<int>(comp_idx.size());
+             n_covs_ = covariate.ncol;
+             n_elem_ = arg_n_elem_;
+
+             if (n_comp == 0 || n_covs_ == 0) { q_mat_.clear(); mark_run_complete(); return; }
+
+             if (n_elem_ < 2)
+               Rcpp::stop("RwNoisyOrCardKernel requires kernel_args$n_elem >= 2; got n_elem=%d", n_elem_);
+             if (n_covs_ != n_elem_)
+               Rcpp::stop("RwNoisyOrCardKernel requires covariate columns (%d) to equal kernel_args$n_elem (%d)",
+                          n_covs_, n_elem_);
+             if (!feat_one_1_idx_ || !feat_two_1_idx_)
+               Rcpp::stop("RwNoisyOrCardKernel requires kernel_args$feat_one_1_idx_column and kernel_args$feat_two_1_idx_column");
+
+             const double* q0_col         = kernel_pars.cols[0];
+             const double* alpha_col      = kernel_pars.cols[1];
+             const double* sat_single_col = kernel_pars.cols[2];
+             const double* sat_double_col = kernel_pars.cols[3];
+             const double* gamma_col      = kernel_pars.cols[4];
+
+             const int row0 = comp_idx[0];
+             std::vector<double> q(n_elem_, clamp01(q0_col[row0]));
+             q_mat_.assign(n_comp * n_elem_, 0.0);
+
+             std::vector<int> active;
+             active.reserve(4);
+
+             emit_row(0, row0, sat_single_col, sat_double_col, gamma_col, q);
+
+             for (int j = 0; j < n_comp - 1; ++j) {
+               const int r = comp_idx[j];
+               if (q_reset_ && q_reset_[r] == 1) {
+                 std::fill(q.begin(), q.end(), clamp01(q0_col[r]));
+                 emit_row(j, r, sat_single_col, sat_double_col, gamma_col, q);
+               }
+
+               // Gradient update through the OR link over the active (non-NA cov) cues.
+               // The shared non-NA covariate value is the trial reward.
+               active.clear();
+               double reward = NA_REAL;
+               for (int e = 0; e < n_elem_; ++e) {
+                 const double x = covariate(r, e);
+                 if (!is_nan(x)) { reward = x; active.push_back(e); }
+               }
+               if (!active.empty() && !is_nan(reward)) {
+                 const double alpha = alpha_col[r];
+                 double fail_prod = 1.0;
+                 for (size_t a = 0; a < active.size(); ++a)
+                   fail_prod *= (1.0 - q[active[a]]);
+                 const double v  = 1.0 - fail_prod;
+                 const double pe = reward - v;
+                 // simultaneous update from PRE-update q's: grad_e = prod_{f!=e}(1-q_f)
+                 std::vector<double> q_new(active.size());
+                 for (size_t a = 0; a < active.size(); ++a) {
+                   const int e = active[a];
+                   double grad = 1.0;
+                   for (size_t b = 0; b < active.size(); ++b) {
+                     if (b == a) continue;
+                     grad *= (1.0 - q[active[b]]);
+                   }
+                   q_new[a] = clamp01(q[e] + alpha * pe * grad);
+                 }
+                 for (size_t a = 0; a < active.size(); ++a) q[active[a]] = q_new[a];
+               }
+
+               const int next_r = comp_idx[j + 1];
+               emit_row(j + 1, next_r, sat_single_col, sat_double_col, gamma_col, q);
+             }
+             mark_run_complete();
+           }
+
+  KernelOutput get_output_stream(int code) const override {
+    if (code != 1)
+      Rcpp::stop("RwNoisyOrCardKernel::get_output_stream: unsupported code %d (1=AllocShape)", code);
+    if (n_elem_ <= 0) return KernelOutput{ q_mat_.data(), 0, 0 };
+
+    const int n_comp = static_cast<int>(q_mat_.size()) / n_elem_;
+    std::vector<double>& buf = stream_buf_[0];
+
+    if (has_expand_idx_) {
+      const int n_full = static_cast<int>(expand_idx_.size());
+      buf.resize(n_full * n_elem_);
+      for (int c = 0; c < n_elem_; ++c)
+        for (int i = 0; i < n_full; ++i) {
+          int comp_row = expand_idx_[i] - 1;
+          buf[c * n_full + i] = q_mat_[comp_row * n_elem_ + c];
+        }
+      return KernelOutput{ buf.data(), n_full, n_elem_ };
+    }
+
+    buf.resize(n_comp * n_elem_);
+    for (int c = 0; c < n_elem_; ++c)
+      for (int r = 0; r < n_comp; ++r)
+        buf[c * n_comp + r] = q_mat_[r * n_elem_ + c];
+    return KernelOutput{ buf.data(), n_comp, n_elem_ };
+  }
+
+  std::string output_stream_name(int code) const override {
+    if (code == 1) return "AllocShape";
+    throw std::runtime_error("RwNoisyOrCardKernel::output_stream_name: unsupported code");
+  }
+};
+
+
+// =============================================================================
 // DeltaSatlinkGammaCardExpdecrKernel — CARDINALITY-saturation satlink read-out
 // (delta) with an exp-DECREASING learning rate. = DeltaSatlinkGammaCardKernel +
 // the DeltaExpdecr schedule. Identical cardsat geometry/read-out (per-feature
@@ -2443,6 +3070,517 @@ public:
   std::string output_stream_name(int code) const override {
     if (code == 1) return "AllocShape";
     throw std::runtime_error("RwSatlinkGammaCardKernel::output_stream_name: unsupported code");
+  }
+};
+
+
+// =============================================================================
+// RwSatlinkDimCardKernel — PER-DIMENSION trial-type saturating satlink read-out
+// with RESCORLA-WAGNER (shared/summed PE) learning. Fuses RwSatlinkGammaCardKernel's
+// learner with DeltaSatlinkDimCardKernel's per-stream emission, for the win-all /
+// win-one per-feature races (the LADDER learner lesion):
+//   * ONE Q store over the combined {elemental, configural} cue set; the chosen
+//     option's active (non-NA covariate) cues {feat_1, feat_2, compound} share ONE
+//     PE = reward - sum(active Q) (cue competition), exactly as RwSatlinkGammaCardKernel.
+//   * Emission is PER STREAM instead of one combined D: AllocShape
+//     [g(d1), g(d2), g(d_cfg), 0, ...] with d1 = q_one1 - q_two1 (dimension 1),
+//     d2 = q_one2 - q_two2 (dimension 2), d_cfg = q_one3 - q_two3 (compound), each
+//     through its own satlink g(d) = sat*tanh(d^gamma/sat). Route d1/d2 to the
+//     per-dimension feature accumulators and d_cfg team-wide with ONE coding map
+//     (a shared-PE learner makes elemental + configural one value system -> one weight).
+//   * TRIAL-TYPE saturation (fcsat): ONE sat per trial for ALL streams -- sat_double
+//     when the trial has a second elemental feature (Double), else sat_single. The
+//     compound cue only exists on Double trials, so it always rides sat_double.
+// Requires kernel_args: n_elem, feat_one_1_idx_column, feat_two_1_idx_column
+// (+ optional feat_one_2/feat_two_2/feat_one_3/feat_two_3 + q_reset_column).
+// Parameters: q0, alpha, sat_single, sat_double, gamma.
+// =============================================================================
+struct RwSatlinkDimCardKernel : SequentialKernel {
+private:
+  int n_elem_ = 0;
+  int n_covs_ = 0;
+
+  const int* q_reset_ = nullptr;
+  const int* feat_one_1_idx_ = nullptr;
+  const int* feat_one_2_idx_ = nullptr;
+  const int* feat_one_3_idx_ = nullptr;
+  const int* feat_two_1_idx_ = nullptr;
+  const int* feat_two_2_idx_ = nullptr;
+  const int* feat_two_3_idx_ = nullptr;
+  int arg_n_elem_ = -1;
+
+  // Compressed [n_comp x n_elem_] allocation shape, row-major: [g1, g2, g_cfg, 0, ...]
+  std::vector<double> q_mat_;
+
+  static double sat_link(double d, double theta, double gamma) {
+    double dpow = d;
+    if (!is_nan(gamma) && gamma > 0.0 && gamma != 1.0) {
+      const double ad = std::fabs(d);
+      dpow = (d < 0.0 ? -1.0 : 1.0) * std::pow(ad, gamma);
+    }
+    if (is_nan(theta) || theta <= 0.0) return dpow;
+    if (theta > 1e6) return dpow;     // saturation off; avoid 0*inf overflow
+    return theta * std::tanh(dpow / theta);
+  }
+
+  int required_feat_index(const int* arr, int row, const char* arg_name) const {
+    if (!arr) {
+      Rcpp::stop("RwSatlinkDimCardKernel requires kernel_args$%s", arg_name);
+    }
+    const int value = arr[row];
+    if (value == NA_INTEGER || value <= 0) {
+      Rcpp::stop("RwSatlinkDimCardKernel requires kernel_args$%s[%d] to be a positive 1-based index",
+                 arg_name, row + 1);
+    }
+    const int idx = value - 1;
+    if (idx < 0 || idx >= n_elem_) {
+      Rcpp::stop("RwSatlinkDimCardKernel kernel_args$%s[%d]=%d is outside 1:n_elem (%d)",
+                 arg_name, row + 1, value, n_elem_);
+    }
+    return idx;
+  }
+
+  int optional_feat_index(const int* arr, int row, const char* arg_name) const {
+    if (!arr) return -1;
+    const int value = arr[row];
+    if (value == NA_INTEGER || value <= 0) return -1;
+    const int idx = value - 1;
+    if (idx < 0 || idx >= n_elem_) {
+      Rcpp::stop("RwSatlinkDimCardKernel kernel_args$%s[%d]=%d is outside 1:n_elem (%d)",
+                 arg_name, row + 1, value, n_elem_);
+    }
+    return idx;
+  }
+
+  void emit_row(int j, int r,
+                const double* sat_single_col, const double* sat_double_col,
+                const double* gamma_col,
+                const std::vector<double>& q) {
+    const int i11 = required_feat_index(feat_one_1_idx_, r, "feat_one_1_idx_column");
+    const int i12 = optional_feat_index(feat_one_2_idx_, r, "feat_one_2_idx_column");
+    const int i13 = optional_feat_index(feat_one_3_idx_, r, "feat_one_3_idx_column");
+    const int i21 = required_feat_index(feat_two_1_idx_, r, "feat_two_1_idx_column");
+    const int i22 = optional_feat_index(feat_two_2_idx_, r, "feat_two_2_idx_column");
+    const int i23 = optional_feat_index(feat_two_3_idx_, r, "feat_two_3_idx_column");
+
+    // TRIAL-TYPE saturation: one sat per trial for ALL streams (a present second
+    // elemental feature marks a Double trial -> sat_double; else sat_single).
+    const bool two_item = (i12 >= 0) || (i22 >= 0);
+    const double sat = two_item ? sat_double_col[r] : sat_single_col[r];
+    const double gam = gamma_col[r];
+
+    const double d1 = q[i11] - q[i21];               // dimension 1 advantage
+    const double g1 = sat_link(d1, sat, gam);
+    double g2 = 0.0;
+    if (i12 >= 0 && i22 >= 0) {                      // dimension 2 present on both options
+      g2 = sat_link(q[i12] - q[i22], sat, gam);
+    }
+    double g3 = 0.0;
+    if (i13 >= 0 && i23 >= 0) {                      // configural compound (Double only)
+      g3 = sat_link(q[i13] - q[i23], sat, gam);
+    }
+
+    double* row_out = &q_mat_[j * n_elem_];
+    row_out[0] = g1;   // routed to opt1_f1(+) / opt2_f1(-)
+    row_out[1] = g2;   // routed to opt1_f2(+) / opt2_f2(-)
+    row_out[2] = g3;   // routed team-wide: all opt1 rows (+) / opt2 rows (-)
+    for (int c = 3; c < n_elem_; ++c) row_out[c] = 0.0;
+  }
+
+public:
+  void set_kernel_args(const KernelArgs& args) override {
+    q_reset_ = args.q_reset;
+    feat_one_1_idx_ = args.feat_one_1_idx;
+    feat_one_2_idx_ = args.feat_one_2_idx;
+    feat_one_3_idx_ = args.feat_one_3_idx;
+    feat_two_1_idx_ = args.feat_two_1_idx;
+    feat_two_2_idx_ = args.feat_two_2_idx;
+    feat_two_3_idx_ = args.feat_two_3_idx;
+    arg_n_elem_ = args.n_elem;
+  }
+
+  void reset() override {
+    BaseKernel::reset();
+    q_mat_.clear();
+    n_elem_ = 0;
+    n_covs_ = 0;
+  }
+
+  void run(const KernelParsView& kernel_pars,
+           const Mat& covariate,
+           const std::vector<int>& comp_idx) override {
+             if (kernel_pars.cols.size() != 5) {
+               Rcpp::stop("RwSatlinkDimCardKernel expects 5 parameter columns (q0, alpha, sat_single, sat_double, gamma), got %d",
+                          (int)kernel_pars.cols.size());
+             }
+
+             const int n_comp = static_cast<int>(comp_idx.size());
+             n_covs_ = covariate.ncol;
+             n_elem_ = arg_n_elem_;
+
+             if (n_comp == 0 || n_covs_ == 0) {
+               q_mat_.clear();
+               mark_run_complete();
+               return;
+             }
+
+             if (n_elem_ < 3) {
+               Rcpp::stop("RwSatlinkDimCardKernel requires kernel_args$n_elem >= 3 (three emission slots: dim1, dim2, configural); got n_elem=%d",
+                          n_elem_);
+             }
+             if (n_covs_ != n_elem_) {
+               Rcpp::stop("RwSatlinkDimCardKernel requires the number of covariate columns (%d) to equal kernel_args$n_elem (%d)",
+                          n_covs_, n_elem_);
+             }
+             if (!feat_one_1_idx_ || !feat_two_1_idx_) {
+               Rcpp::stop("RwSatlinkDimCardKernel requires kernel_args$feat_one_1_idx_column and kernel_args$feat_two_1_idx_column");
+             }
+
+             const double* q0_col         = kernel_pars.cols[0];
+             const double* alpha_col      = kernel_pars.cols[1];
+             const double* sat_single_col = kernel_pars.cols[2];
+             const double* sat_double_col = kernel_pars.cols[3];
+             const double* gamma_col      = kernel_pars.cols[4];
+
+             const int row0 = comp_idx[0];
+             std::vector<double> q(n_elem_, q0_col[row0]);
+             q_mat_.assign(n_comp * n_elem_, 0.0);
+
+             emit_row(0, row0, sat_single_col, sat_double_col, gamma_col, q);
+
+             for (int j = 0; j < n_comp - 1; ++j) {
+               const int r = comp_idx[j];
+
+               if (q_reset_ && q_reset_[r] == 1) {
+                 std::fill(q.begin(), q.end(), q0_col[r]);
+                 emit_row(j, r, sat_single_col, sat_double_col, gamma_col, q);
+               }
+
+               // Rescorla-Wagner summed-error update over the active (non-NA cov) cues:
+               // one shared PE = reward - sum(active Q) updates every active cue.
+               // (Identical to RwSatlinkGammaCardKernel.)
+               double reward     = NA_REAL;
+               double q_active   = 0.0;
+               bool   any_active = false;
+               for (int e = 0; e < n_elem_; ++e) {
+                 const double x = covariate(r, e);
+                 if (!is_nan(x)) {
+                   reward     = x;   // shared across all active cues
+                   q_active  += q[e];
+                   any_active = true;
+                 }
+               }
+               if (any_active && !is_nan(reward)) {
+                 const double alpha       = alpha_col[r];
+                 const double compound_pe = reward - q_active;
+                 for (int e = 0; e < n_elem_; ++e) {
+                   if (!is_nan(covariate(r, e))) {
+                     q[e] += alpha * compound_pe;
+                   }
+                 }
+               }
+
+               const int next_r = comp_idx[j + 1];
+               emit_row(j + 1, next_r, sat_single_col, sat_double_col, gamma_col, q);
+             }
+
+             mark_run_complete();
+           }
+
+  KernelOutput get_output_stream(int code) const override {
+    if (code != 1) {
+      Rcpp::stop("RwSatlinkDimCardKernel::get_output_stream: unsupported code %d (1=AllocShape)", code);
+    }
+
+    if (n_elem_ <= 0) return KernelOutput{ q_mat_.data(), 0, 0 };
+
+    const int n_comp = static_cast<int>(q_mat_.size()) / n_elem_;
+    std::vector<double>& buf = stream_buf_[0];
+
+    if (has_expand_idx_) {
+      const int n_full = static_cast<int>(expand_idx_.size());
+      buf.resize(n_full * n_elem_);
+
+      for (int c = 0; c < n_elem_; ++c) {
+        for (int i = 0; i < n_full; ++i) {
+          int comp_row = expand_idx_[i] - 1;
+          buf[c * n_full + i] = q_mat_[comp_row * n_elem_ + c];
+        }
+      }
+
+      return KernelOutput{ buf.data(), n_full, n_elem_ };
+    }
+
+    buf.resize(n_comp * n_elem_);
+
+    for (int c = 0; c < n_elem_; ++c) {
+      for (int r = 0; r < n_comp; ++r) {
+        buf[c * n_comp + r] = q_mat_[r * n_elem_ + c];
+      }
+    }
+
+    return KernelOutput{ buf.data(), n_comp, n_elem_ };
+  }
+
+  std::string output_stream_name(int code) const override {
+    if (code == 1) return "AllocShape";
+    throw std::runtime_error("RwSatlinkDimCardKernel::output_stream_name: unsupported code");
+  }
+};
+
+
+// =============================================================================
+// RwSatlinkDimCardFfKernel — FULL-FEEDBACK sibling of RwSatlinkDimCardKernel.
+// Same per-dimension trial-type saturating emission (AllocShape
+// [g(d1), g(d2), g(d_cfg), 0, ...]) but the LEARNING does TWO per-option
+// summed-error updates per trial (both options' outcomes observed every trial),
+// exactly as RwSatlinkGammaCardFfKernel:
+//   PE_one = r_one - sum(Q over option-1 cues {feat_one_1, feat_one_2, feat_one_3});
+//   PE_two likewise for option 2. r_one/r_two are read from each option's FIRST
+//   cue's covariate column (full-feedback covariates set every present cue to its
+//   OWN option's reward), so the two options never conflate — unlike the partial-
+//   feedback RwSatlinkDimCardKernel, whose single shared PE over ALL active cues
+//   would mix the two options under full feedback.
+// For the win-all race RW learner lesion in the full-feedback (blocking) design.
+// Requires kernel_args: n_elem, feat_one_1_idx_column, feat_two_1_idx_column
+// (+ optional feat_one_2/feat_two_2/feat_one_3/feat_two_3 + q_reset_column).
+// Parameters: q0, alpha, sat_single, sat_double, gamma.
+// =============================================================================
+struct RwSatlinkDimCardFfKernel : SequentialKernel {
+private:
+  int n_elem_ = 0;
+  int n_covs_ = 0;
+
+  const int* q_reset_ = nullptr;
+  const int* feat_one_1_idx_ = nullptr;
+  const int* feat_one_2_idx_ = nullptr;
+  const int* feat_one_3_idx_ = nullptr;
+  const int* feat_two_1_idx_ = nullptr;
+  const int* feat_two_2_idx_ = nullptr;
+  const int* feat_two_3_idx_ = nullptr;
+  int arg_n_elem_ = -1;
+
+  // Compressed [n_comp x n_elem_] allocation shape, row-major: [g1, g2, g_cfg, 0, ...]
+  std::vector<double> q_mat_;
+
+  static double sat_link(double d, double theta, double gamma) {
+    double dpow = d;
+    if (!is_nan(gamma) && gamma > 0.0 && gamma != 1.0) {
+      const double ad = std::fabs(d);
+      dpow = (d < 0.0 ? -1.0 : 1.0) * std::pow(ad, gamma);
+    }
+    if (is_nan(theta) || theta <= 0.0) return dpow;
+    if (theta > 1e6) return dpow;     // saturation off; avoid 0*inf overflow
+    return theta * std::tanh(dpow / theta);
+  }
+
+  int required_feat_index(const int* arr, int row, const char* arg_name) const {
+    if (!arr) {
+      Rcpp::stop("RwSatlinkDimCardFfKernel requires kernel_args$%s", arg_name);
+    }
+    const int value = arr[row];
+    if (value == NA_INTEGER || value <= 0) {
+      Rcpp::stop("RwSatlinkDimCardFfKernel requires kernel_args$%s[%d] to be a positive 1-based index",
+                 arg_name, row + 1);
+    }
+    const int idx = value - 1;
+    if (idx < 0 || idx >= n_elem_) {
+      Rcpp::stop("RwSatlinkDimCardFfKernel kernel_args$%s[%d]=%d is outside 1:n_elem (%d)",
+                 arg_name, row + 1, value, n_elem_);
+    }
+    return idx;
+  }
+
+  int optional_feat_index(const int* arr, int row, const char* arg_name) const {
+    if (!arr) return -1;
+    const int value = arr[row];
+    if (value == NA_INTEGER || value <= 0) return -1;
+    const int idx = value - 1;
+    if (idx < 0 || idx >= n_elem_) {
+      Rcpp::stop("RwSatlinkDimCardFfKernel kernel_args$%s[%d]=%d is outside 1:n_elem (%d)",
+                 arg_name, row + 1, value, n_elem_);
+    }
+    return idx;
+  }
+
+  void emit_row(int j, int r,
+                const double* sat_single_col, const double* sat_double_col,
+                const double* gamma_col,
+                const std::vector<double>& q) {
+    const int i11 = required_feat_index(feat_one_1_idx_, r, "feat_one_1_idx_column");
+    const int i12 = optional_feat_index(feat_one_2_idx_, r, "feat_one_2_idx_column");
+    const int i13 = optional_feat_index(feat_one_3_idx_, r, "feat_one_3_idx_column");
+    const int i21 = required_feat_index(feat_two_1_idx_, r, "feat_two_1_idx_column");
+    const int i22 = optional_feat_index(feat_two_2_idx_, r, "feat_two_2_idx_column");
+    const int i23 = optional_feat_index(feat_two_3_idx_, r, "feat_two_3_idx_column");
+
+    // TRIAL-TYPE saturation: one sat per trial for ALL streams (a present second
+    // elemental feature marks a Double trial -> sat_double; else sat_single).
+    const bool two_item = (i12 >= 0) || (i22 >= 0);
+    const double sat = two_item ? sat_double_col[r] : sat_single_col[r];
+    const double gam = gamma_col[r];
+
+    const double d1 = q[i11] - q[i21];               // dimension 1 advantage
+    const double g1 = sat_link(d1, sat, gam);
+    double g2 = 0.0;
+    if (i12 >= 0 && i22 >= 0) {                      // dimension 2 present on both options
+      g2 = sat_link(q[i12] - q[i22], sat, gam);
+    }
+    double g3 = 0.0;
+    if (i13 >= 0 && i23 >= 0) {                      // configural compound (Double only)
+      g3 = sat_link(q[i13] - q[i23], sat, gam);
+    }
+
+    double* row_out = &q_mat_[j * n_elem_];
+    row_out[0] = g1;   // routed to opt1_f1(+) / opt2_f1(-)
+    row_out[1] = g2;   // routed to opt1_f2(+) / opt2_f2(-)
+    row_out[2] = g3;   // routed team-wide: all opt1 rows (+) / opt2 rows (-)
+    for (int c = 3; c < n_elem_; ++c) row_out[c] = 0.0;
+  }
+
+public:
+  void set_kernel_args(const KernelArgs& args) override {
+    q_reset_ = args.q_reset;
+    feat_one_1_idx_ = args.feat_one_1_idx;
+    feat_one_2_idx_ = args.feat_one_2_idx;
+    feat_one_3_idx_ = args.feat_one_3_idx;
+    feat_two_1_idx_ = args.feat_two_1_idx;
+    feat_two_2_idx_ = args.feat_two_2_idx;
+    feat_two_3_idx_ = args.feat_two_3_idx;
+    arg_n_elem_ = args.n_elem;
+  }
+
+  void reset() override {
+    BaseKernel::reset();
+    q_mat_.clear();
+    n_elem_ = 0;
+    n_covs_ = 0;
+  }
+
+  void run(const KernelParsView& kernel_pars,
+           const Mat& covariate,
+           const std::vector<int>& comp_idx) override {
+             if (kernel_pars.cols.size() != 5) {
+               Rcpp::stop("RwSatlinkDimCardFfKernel expects 5 parameter columns (q0, alpha, sat_single, sat_double, gamma), got %d",
+                          (int)kernel_pars.cols.size());
+             }
+
+             const int n_comp = static_cast<int>(comp_idx.size());
+             n_covs_ = covariate.ncol;
+             n_elem_ = arg_n_elem_;
+
+             if (n_comp == 0 || n_covs_ == 0) {
+               q_mat_.clear();
+               mark_run_complete();
+               return;
+             }
+
+             if (n_elem_ < 3) {
+               Rcpp::stop("RwSatlinkDimCardFfKernel requires kernel_args$n_elem >= 3 (three emission slots: dim1, dim2, configural); got n_elem=%d",
+                          n_elem_);
+             }
+             if (n_covs_ != n_elem_) {
+               Rcpp::stop("RwSatlinkDimCardFfKernel requires the number of covariate columns (%d) to equal kernel_args$n_elem (%d)",
+                          n_covs_, n_elem_);
+             }
+             if (!feat_one_1_idx_ || !feat_two_1_idx_) {
+               Rcpp::stop("RwSatlinkDimCardFfKernel requires kernel_args$feat_one_1_idx_column and kernel_args$feat_two_1_idx_column");
+             }
+
+             const double* q0_col         = kernel_pars.cols[0];
+             const double* alpha_col      = kernel_pars.cols[1];
+             const double* sat_single_col = kernel_pars.cols[2];
+             const double* sat_double_col = kernel_pars.cols[3];
+             const double* gamma_col      = kernel_pars.cols[4];
+
+             const int row0 = comp_idx[0];
+             std::vector<double> q(n_elem_, q0_col[row0]);
+             q_mat_.assign(n_comp * n_elem_, 0.0);
+
+             emit_row(0, row0, sat_single_col, sat_double_col, gamma_col, q);
+
+             for (int j = 0; j < n_comp - 1; ++j) {
+               const int r = comp_idx[j];
+
+               if (q_reset_ && q_reset_[r] == 1) {
+                 std::fill(q.begin(), q.end(), q0_col[r]);
+                 emit_row(j, r, sat_single_col, sat_double_col, gamma_col, q);
+               }
+
+               // FULL-FEEDBACK RW: two per-option summed-error updates on the shared Q.
+               // (Identical to RwSatlinkGammaCardFfKernel's update block.)
+               const int u_i11 = required_feat_index(feat_one_1_idx_, r, "feat_one_1_idx_column");
+               const int u_i12 = optional_feat_index(feat_one_2_idx_, r, "feat_one_2_idx_column");
+               const int u_i13 = optional_feat_index(feat_one_3_idx_, r, "feat_one_3_idx_column");
+               const int u_i21 = required_feat_index(feat_two_1_idx_, r, "feat_two_1_idx_column");
+               const int u_i22 = optional_feat_index(feat_two_2_idx_, r, "feat_two_2_idx_column");
+               const int u_i23 = optional_feat_index(feat_two_3_idx_, r, "feat_two_3_idx_column");
+               const double alpha = alpha_col[r];
+
+               // Option 1: reward from option-1's first cue's covariate column.
+               const double r_one = covariate(r, u_i11);
+               if (!is_nan(r_one)) {
+                 double sum_one = q[u_i11] + (u_i12 >= 0 ? q[u_i12] : 0.0) + (u_i13 >= 0 ? q[u_i13] : 0.0);
+                 double pe_one = r_one - sum_one;
+                 q[u_i11] += alpha * pe_one;
+                 if (u_i12 >= 0) q[u_i12] += alpha * pe_one;
+                 if (u_i13 >= 0) q[u_i13] += alpha * pe_one;
+               }
+               // Option 2: reward from option-2's first cue's covariate column.
+               const double r_two = covariate(r, u_i21);
+               if (!is_nan(r_two)) {
+                 double sum_two = q[u_i21] + (u_i22 >= 0 ? q[u_i22] : 0.0) + (u_i23 >= 0 ? q[u_i23] : 0.0);
+                 double pe_two = r_two - sum_two;
+                 q[u_i21] += alpha * pe_two;
+                 if (u_i22 >= 0) q[u_i22] += alpha * pe_two;
+                 if (u_i23 >= 0) q[u_i23] += alpha * pe_two;
+               }
+
+               const int next_r = comp_idx[j + 1];
+               emit_row(j + 1, next_r, sat_single_col, sat_double_col, gamma_col, q);
+             }
+
+             mark_run_complete();
+           }
+
+  KernelOutput get_output_stream(int code) const override {
+    if (code != 1) {
+      Rcpp::stop("RwSatlinkDimCardFfKernel::get_output_stream: unsupported code %d (1=AllocShape)", code);
+    }
+
+    if (n_elem_ <= 0) return KernelOutput{ q_mat_.data(), 0, 0 };
+
+    const int n_comp = static_cast<int>(q_mat_.size()) / n_elem_;
+    std::vector<double>& buf = stream_buf_[0];
+
+    if (has_expand_idx_) {
+      const int n_full = static_cast<int>(expand_idx_.size());
+      buf.resize(n_full * n_elem_);
+
+      for (int c = 0; c < n_elem_; ++c) {
+        for (int i = 0; i < n_full; ++i) {
+          int comp_row = expand_idx_[i] - 1;
+          buf[c * n_full + i] = q_mat_[comp_row * n_elem_ + c];
+        }
+      }
+
+      return KernelOutput{ buf.data(), n_full, n_elem_ };
+    }
+
+    buf.resize(n_comp * n_elem_);
+
+    for (int c = 0; c < n_elem_; ++c) {
+      for (int r = 0; r < n_comp; ++r) {
+        buf[c * n_comp + r] = q_mat_[r * n_elem_ + c];
+      }
+    }
+
+    return KernelOutput{ buf.data(), n_comp, n_elem_ };
+  }
+
+  std::string output_stream_name(int code) const override {
+    if (code == 1) return "AllocShape";
+    throw std::runtime_error("RwSatlinkDimCardFfKernel::output_stream_name: unsupported code");
   }
 };
 
@@ -3218,6 +4356,489 @@ public:
 };
 
 
+// =============================================================================
+// RwSatlinkGammaCard2chKernel -- TWO-CHANNEL read-out sibling of RwSatlinkGammaCardKernel
+// (partial feedback). LEARNING IS BYTE-IDENTICAL to RwSatlinkGammaCardKernel: one shared Q
+// store over {feat_1, feat_2, compound}, one shared summed PE = reward - sum(active Q) per
+// trial (the configural compound STAYS in cue competition). The ONLY difference is the
+// READ-OUT emission: the elemental advantage (features only) and the configural advantage
+// (compound only) are emitted as SEPARATE AllocShape column pairs, so each can carry its
+// OWN weight (w_d vs w_d_cfg) via two bases sharing this kernel:
+//   d_elem = (q_one1 + q_one2) - (q_two1 + q_two2), sat by trial cardinality (feat_*_2)
+//   d_cfg  =  q_one3 - q_two3                      , always sat_double (compound = Double)
+//   emit [g_elem, -g_elem, g_cfg, -g_cfg, 0, ...]  (route cols 1-2 -> w_d, cols 3-4 -> w_d_cfg)
+// Requires n_elem >= 4. Parameters unchanged: q0, alpha, sat_single, sat_double, gamma.
+// =============================================================================
+struct RwSatlinkGammaCard2chKernel : SequentialKernel {
+private:
+  int n_elem_ = 0;
+  int n_covs_ = 0;
+
+  const int* q_reset_ = nullptr;
+  const int* feat_one_1_idx_ = nullptr;
+  const int* feat_one_2_idx_ = nullptr;
+  const int* feat_one_3_idx_ = nullptr;
+  const int* feat_two_1_idx_ = nullptr;
+  const int* feat_two_2_idx_ = nullptr;
+  const int* feat_two_3_idx_ = nullptr;
+  int arg_n_elem_ = -1;
+
+  std::vector<double> q_mat_;
+
+  static double sat_link(double d, double theta, double gamma) {
+    double dpow = d;
+    if (!is_nan(gamma) && gamma > 0.0 && gamma != 1.0) {
+      const double ad = std::fabs(d);
+      dpow = (d < 0.0 ? -1.0 : 1.0) * std::pow(ad, gamma);
+    }
+    if (is_nan(theta) || theta <= 0.0) return dpow;
+    if (theta > 1e6) return dpow;
+    return theta * std::tanh(dpow / theta);
+  }
+
+  int required_feat_index(const int* arr, int row, const char* arg_name) const {
+    if (!arr) {
+      Rcpp::stop("RwSatlinkGammaCard2chKernel requires kernel_args$%s", arg_name);
+    }
+    const int value = arr[row];
+    if (value == NA_INTEGER || value <= 0) {
+      Rcpp::stop("RwSatlinkGammaCard2chKernel requires kernel_args$%s[%d] to be a positive 1-based index",
+                 arg_name, row + 1);
+    }
+    const int idx = value - 1;
+    if (idx < 0 || idx >= n_elem_) {
+      Rcpp::stop("RwSatlinkGammaCard2chKernel kernel_args$%s[%d]=%d is outside 1:n_elem (%d)",
+                 arg_name, row + 1, value, n_elem_);
+    }
+    return idx;
+  }
+
+  int optional_feat_index(const int* arr, int row, const char* arg_name) const {
+    if (!arr) return -1;
+    const int value = arr[row];
+    if (value == NA_INTEGER || value <= 0) return -1;
+    const int idx = value - 1;
+    if (idx < 0 || idx >= n_elem_) {
+      Rcpp::stop("RwSatlinkGammaCard2chKernel kernel_args$%s[%d]=%d is outside 1:n_elem (%d)",
+                 arg_name, row + 1, value, n_elem_);
+    }
+    return idx;
+  }
+
+  void emit_row(int j, int r,
+                const double* sat_single_col, const double* sat_double_col,
+                const double* gamma_col,
+                const std::vector<double>& q) {
+    const int i11 = required_feat_index(feat_one_1_idx_, r, "feat_one_1_idx_column");
+    const int i12 = optional_feat_index(feat_one_2_idx_, r, "feat_one_2_idx_column");
+    const int i13 = optional_feat_index(feat_one_3_idx_, r, "feat_one_3_idx_column");
+    const int i21 = required_feat_index(feat_two_1_idx_, r, "feat_two_1_idx_column");
+    const int i22 = optional_feat_index(feat_two_2_idx_, r, "feat_two_2_idx_column");
+    const int i23 = optional_feat_index(feat_two_3_idx_, r, "feat_two_3_idx_column");
+
+    const double q11 = q[i11];
+    const double q12 = (i12 >= 0) ? q[i12] : 0.0;
+    const double q13 = (i13 >= 0) ? q[i13] : 0.0;
+    const double q21 = q[i21];
+    const double q22 = (i22 >= 0) ? q[i22] : 0.0;
+    const double q23 = (i23 >= 0) ? q[i23] : 0.0;
+
+    // ELEMENTAL channel: features only (compound EXCLUDED); sat by trial cardinality.
+    const double d_elem   = (q11 + q12) - (q21 + q22);
+    const bool   two_item = (i12 >= 0) || (i22 >= 0);
+    const double sat_e    = two_item ? sat_double_col[r] : sat_single_col[r];
+    const double g_elem   = sat_link(d_elem, sat_e, gamma_col[r]);
+
+    // CONFIGURAL channel: compound cue only; exists on Double trials -> always sat_double.
+    double g_cfg = 0.0;
+    if (i13 >= 0 && i23 >= 0) {
+      const double d_cfg = q13 - q23;
+      g_cfg = sat_link(d_cfg, sat_double_col[r], gamma_col[r]);
+    }
+
+    double* row_out = &q_mat_[j * n_elem_];
+    row_out[0] =  g_elem;   // cols 1-2 (R): elemental advantage  -> coding d     -> w_d
+    row_out[1] = -g_elem;
+    row_out[2] =  g_cfg;    // cols 3-4 (R): configural advantage -> coding d_cfg -> w_d_cfg
+    row_out[3] = -g_cfg;
+    for (int c = 4; c < n_elem_; ++c) row_out[c] = 0.0;
+  }
+
+public:
+  void set_kernel_args(const KernelArgs& args) override {
+    q_reset_ = args.q_reset;
+    feat_one_1_idx_ = args.feat_one_1_idx;
+    feat_one_2_idx_ = args.feat_one_2_idx;
+    feat_one_3_idx_ = args.feat_one_3_idx;
+    feat_two_1_idx_ = args.feat_two_1_idx;
+    feat_two_2_idx_ = args.feat_two_2_idx;
+    feat_two_3_idx_ = args.feat_two_3_idx;
+    arg_n_elem_ = args.n_elem;
+  }
+
+  void reset() override {
+    BaseKernel::reset();
+    q_mat_.clear();
+    n_elem_ = 0;
+    n_covs_ = 0;
+  }
+
+  void run(const KernelParsView& kernel_pars,
+           const Mat& covariate,
+           const std::vector<int>& comp_idx) override {
+             if (kernel_pars.cols.size() != 5) {
+               Rcpp::stop("RwSatlinkGammaCard2chKernel expects 5 parameter columns (q0, alpha, sat_single, sat_double, gamma), got %d",
+                          (int)kernel_pars.cols.size());
+             }
+
+             const int n_comp = static_cast<int>(comp_idx.size());
+             n_covs_ = covariate.ncol;
+             n_elem_ = arg_n_elem_;
+
+             if (n_comp == 0 || n_covs_ == 0) {
+               q_mat_.clear();
+               mark_run_complete();
+               return;
+             }
+
+             if (n_elem_ < 4) {
+               Rcpp::stop("RwSatlinkGammaCard2chKernel requires kernel_args$n_elem >= 4 to emit separate elemental + configural advantage columns; got n_elem=%d",
+                          n_elem_);
+             }
+             if (n_covs_ != n_elem_) {
+               Rcpp::stop("RwSatlinkGammaCard2chKernel requires the number of covariate columns (%d) to equal kernel_args$n_elem (%d)",
+                          n_covs_, n_elem_);
+             }
+             if (!feat_one_1_idx_ || !feat_two_1_idx_) {
+               Rcpp::stop("RwSatlinkGammaCard2chKernel requires kernel_args$feat_one_1_idx_column and kernel_args$feat_two_1_idx_column");
+             }
+
+             const double* q0_col         = kernel_pars.cols[0];
+             const double* alpha_col      = kernel_pars.cols[1];
+             const double* sat_single_col = kernel_pars.cols[2];
+             const double* sat_double_col = kernel_pars.cols[3];
+             const double* gamma_col      = kernel_pars.cols[4];
+
+             const int row0 = comp_idx[0];
+             std::vector<double> q(n_elem_, q0_col[row0]);
+             q_mat_.assign(n_comp * n_elem_, 0.0);
+
+             emit_row(0, row0, sat_single_col, sat_double_col, gamma_col, q);
+
+             for (int j = 0; j < n_comp - 1; ++j) {
+               const int r = comp_idx[j];
+
+               if (q_reset_ && q_reset_[r] == 1) {
+                 std::fill(q.begin(), q.end(), q0_col[r]);
+                 emit_row(j, r, sat_single_col, sat_double_col, gamma_col, q);
+               }
+
+               // Rescorla-Wagner summed-error update -- IDENTICAL to RwSatlinkGammaCardKernel
+               // (one shared PE = reward - sum(active Q) updates every active cue; the
+               // compound stays in the competition). Only the read-out emission is split.
+               double reward     = NA_REAL;
+               double q_active   = 0.0;
+               bool   any_active = false;
+               for (int e = 0; e < n_elem_; ++e) {
+                 const double x = covariate(r, e);
+                 if (!is_nan(x)) {
+                   reward     = x;
+                   q_active  += q[e];
+                   any_active = true;
+                 }
+               }
+               if (any_active && !is_nan(reward)) {
+                 const double alpha       = alpha_col[r];
+                 const double compound_pe = reward - q_active;
+                 for (int e = 0; e < n_elem_; ++e) {
+                   if (!is_nan(covariate(r, e))) {
+                     q[e] += alpha * compound_pe;
+                   }
+                 }
+               }
+
+               const int next_r = comp_idx[j + 1];
+               emit_row(j + 1, next_r, sat_single_col, sat_double_col, gamma_col, q);
+             }
+
+             mark_run_complete();
+           }
+
+  KernelOutput get_output_stream(int code) const override {
+    if (code != 1) {
+      Rcpp::stop("RwSatlinkGammaCard2chKernel::get_output_stream: unsupported code %d (1=AllocShape)", code);
+    }
+    if (n_elem_ <= 0) return KernelOutput{ q_mat_.data(), 0, 0 };
+    const int n_comp = static_cast<int>(q_mat_.size()) / n_elem_;
+    std::vector<double>& buf = stream_buf_[0];
+    if (has_expand_idx_) {
+      const int n_full = static_cast<int>(expand_idx_.size());
+      buf.resize(n_full * n_elem_);
+      for (int c = 0; c < n_elem_; ++c) {
+        for (int i = 0; i < n_full; ++i) {
+          int comp_row = expand_idx_[i] - 1;
+          buf[c * n_full + i] = q_mat_[comp_row * n_elem_ + c];
+        }
+      }
+      return KernelOutput{ buf.data(), n_full, n_elem_ };
+    }
+    buf.resize(n_comp * n_elem_);
+    for (int c = 0; c < n_elem_; ++c) {
+      for (int r = 0; r < n_comp; ++r) {
+        buf[c * n_comp + r] = q_mat_[r * n_elem_ + c];
+      }
+    }
+    return KernelOutput{ buf.data(), n_comp, n_elem_ };
+  }
+
+  std::string output_stream_name(int code) const override {
+    if (code == 1) return "AllocShape";
+    throw std::runtime_error("RwSatlinkGammaCard2chKernel::output_stream_name: unsupported code");
+  }
+};
+
+
+// =============================================================================
+// RwSatlinkGammaCard2chFfKernel -- FULL-FEEDBACK two-channel read-out. LEARNING IS
+// BYTE-IDENTICAL to RwSatlinkGammaCardFfKernel (one shared Q store over {feat_1, feat_2,
+// compound}; TWO per-option summed-error updates per trial -- the compound STAYS in cue
+// competition). The ONLY difference is the READ-OUT: separate elemental / configural
+// advantage column pairs (see RwSatlinkGammaCard2chKernel). Requires n_elem >= 4.
+// Parameters unchanged: q0, alpha, sat_single, sat_double, gamma.
+// =============================================================================
+struct RwSatlinkGammaCard2chFfKernel : SequentialKernel {
+private:
+  int n_elem_ = 0;
+  int n_covs_ = 0;
+
+  const int* q_reset_ = nullptr;
+  const int* feat_one_1_idx_ = nullptr;
+  const int* feat_one_2_idx_ = nullptr;
+  const int* feat_one_3_idx_ = nullptr;
+  const int* feat_two_1_idx_ = nullptr;
+  const int* feat_two_2_idx_ = nullptr;
+  const int* feat_two_3_idx_ = nullptr;
+  int arg_n_elem_ = -1;
+
+  std::vector<double> q_mat_;
+
+  static double sat_link(double d, double theta, double gamma) {
+    double dpow = d;
+    if (!is_nan(gamma) && gamma > 0.0 && gamma != 1.0) {
+      const double ad = std::fabs(d);
+      dpow = (d < 0.0 ? -1.0 : 1.0) * std::pow(ad, gamma);
+    }
+    if (is_nan(theta) || theta <= 0.0) return dpow;
+    if (theta > 1e6) return dpow;
+    return theta * std::tanh(dpow / theta);
+  }
+
+  int required_feat_index(const int* arr, int row, const char* arg_name) const {
+    if (!arr) {
+      Rcpp::stop("RwSatlinkGammaCard2chFfKernel requires kernel_args$%s", arg_name);
+    }
+    const int value = arr[row];
+    if (value == NA_INTEGER || value <= 0) {
+      Rcpp::stop("RwSatlinkGammaCard2chFfKernel requires kernel_args$%s[%d] to be a positive 1-based index",
+                 arg_name, row + 1);
+    }
+    const int idx = value - 1;
+    if (idx < 0 || idx >= n_elem_) {
+      Rcpp::stop("RwSatlinkGammaCard2chFfKernel kernel_args$%s[%d]=%d is outside 1:n_elem (%d)",
+                 arg_name, row + 1, value, n_elem_);
+    }
+    return idx;
+  }
+
+  int optional_feat_index(const int* arr, int row, const char* arg_name) const {
+    if (!arr) return -1;
+    const int value = arr[row];
+    if (value == NA_INTEGER || value <= 0) return -1;
+    const int idx = value - 1;
+    if (idx < 0 || idx >= n_elem_) {
+      Rcpp::stop("RwSatlinkGammaCard2chFfKernel kernel_args$%s[%d]=%d is outside 1:n_elem (%d)",
+                 arg_name, row + 1, value, n_elem_);
+    }
+    return idx;
+  }
+
+  void emit_row(int j, int r,
+                const double* sat_single_col, const double* sat_double_col,
+                const double* gamma_col,
+                const std::vector<double>& q) {
+    const int i11 = required_feat_index(feat_one_1_idx_, r, "feat_one_1_idx_column");
+    const int i12 = optional_feat_index(feat_one_2_idx_, r, "feat_one_2_idx_column");
+    const int i13 = optional_feat_index(feat_one_3_idx_, r, "feat_one_3_idx_column");
+    const int i21 = required_feat_index(feat_two_1_idx_, r, "feat_two_1_idx_column");
+    const int i22 = optional_feat_index(feat_two_2_idx_, r, "feat_two_2_idx_column");
+    const int i23 = optional_feat_index(feat_two_3_idx_, r, "feat_two_3_idx_column");
+
+    const double q11 = q[i11];
+    const double q12 = (i12 >= 0) ? q[i12] : 0.0;
+    const double q13 = (i13 >= 0) ? q[i13] : 0.0;
+    const double q21 = q[i21];
+    const double q22 = (i22 >= 0) ? q[i22] : 0.0;
+    const double q23 = (i23 >= 0) ? q[i23] : 0.0;
+
+    // ELEMENTAL channel: features only (compound EXCLUDED); sat by trial cardinality.
+    const double d_elem   = (q11 + q12) - (q21 + q22);
+    const bool   two_item = (i12 >= 0) || (i22 >= 0);
+    const double sat_e    = two_item ? sat_double_col[r] : sat_single_col[r];
+    const double g_elem   = sat_link(d_elem, sat_e, gamma_col[r]);
+
+    // CONFIGURAL channel: compound cue only; exists on Double trials -> always sat_double.
+    double g_cfg = 0.0;
+    if (i13 >= 0 && i23 >= 0) {
+      const double d_cfg = q13 - q23;
+      g_cfg = sat_link(d_cfg, sat_double_col[r], gamma_col[r]);
+    }
+
+    double* row_out = &q_mat_[j * n_elem_];
+    row_out[0] =  g_elem;   // cols 1-2 (R): elemental advantage  -> coding d     -> w_d
+    row_out[1] = -g_elem;
+    row_out[2] =  g_cfg;    // cols 3-4 (R): configural advantage -> coding d_cfg -> w_d_cfg
+    row_out[3] = -g_cfg;
+    for (int c = 4; c < n_elem_; ++c) row_out[c] = 0.0;
+  }
+
+public:
+  void set_kernel_args(const KernelArgs& args) override {
+    q_reset_ = args.q_reset;
+    feat_one_1_idx_ = args.feat_one_1_idx;
+    feat_one_2_idx_ = args.feat_one_2_idx;
+    feat_one_3_idx_ = args.feat_one_3_idx;
+    feat_two_1_idx_ = args.feat_two_1_idx;
+    feat_two_2_idx_ = args.feat_two_2_idx;
+    feat_two_3_idx_ = args.feat_two_3_idx;
+    arg_n_elem_ = args.n_elem;
+  }
+
+  void reset() override {
+    BaseKernel::reset();
+    q_mat_.clear();
+    n_elem_ = 0;
+    n_covs_ = 0;
+  }
+
+  void run(const KernelParsView& kernel_pars,
+           const Mat& covariate,
+           const std::vector<int>& comp_idx) override {
+             if (kernel_pars.cols.size() != 5) {
+               Rcpp::stop("RwSatlinkGammaCard2chFfKernel expects 5 parameter columns (q0, alpha, sat_single, sat_double, gamma), got %d",
+                          (int)kernel_pars.cols.size());
+             }
+
+             const int n_comp = static_cast<int>(comp_idx.size());
+             n_covs_ = covariate.ncol;
+             n_elem_ = arg_n_elem_;
+
+             if (n_comp == 0 || n_covs_ == 0) {
+               q_mat_.clear();
+               mark_run_complete();
+               return;
+             }
+
+             if (n_elem_ < 4) {
+               Rcpp::stop("RwSatlinkGammaCard2chFfKernel requires kernel_args$n_elem >= 4 to emit separate elemental + configural advantage columns; got n_elem=%d",
+                          n_elem_);
+             }
+             if (n_covs_ != n_elem_) {
+               Rcpp::stop("RwSatlinkGammaCard2chFfKernel requires the number of covariate columns (%d) to equal kernel_args$n_elem (%d)",
+                          n_covs_, n_elem_);
+             }
+             if (!feat_one_1_idx_ || !feat_two_1_idx_) {
+               Rcpp::stop("RwSatlinkGammaCard2chFfKernel requires kernel_args$feat_one_1_idx_column and kernel_args$feat_two_1_idx_column");
+             }
+
+             const double* q0_col         = kernel_pars.cols[0];
+             const double* alpha_col      = kernel_pars.cols[1];
+             const double* sat_single_col = kernel_pars.cols[2];
+             const double* sat_double_col = kernel_pars.cols[3];
+             const double* gamma_col      = kernel_pars.cols[4];
+
+             const int row0 = comp_idx[0];
+             std::vector<double> q(n_elem_, q0_col[row0]);
+             q_mat_.assign(n_comp * n_elem_, 0.0);
+
+             emit_row(0, row0, sat_single_col, sat_double_col, gamma_col, q);
+
+             for (int j = 0; j < n_comp - 1; ++j) {
+               const int r = comp_idx[j];
+
+               if (q_reset_ && q_reset_[r] == 1) {
+                 std::fill(q.begin(), q.end(), q0_col[r]);
+                 emit_row(j, r, sat_single_col, sat_double_col, gamma_col, q);
+               }
+
+               // FULL-FEEDBACK RW: two per-option summed-error updates on the shared Q --
+               // IDENTICAL to RwSatlinkGammaCardFfKernel (compound stays in the shared PE);
+               // only the read-out emission is split.
+               const int u_i11 = required_feat_index(feat_one_1_idx_, r, "feat_one_1_idx_column");
+               const int u_i12 = optional_feat_index(feat_one_2_idx_, r, "feat_one_2_idx_column");
+               const int u_i13 = optional_feat_index(feat_one_3_idx_, r, "feat_one_3_idx_column");
+               const int u_i21 = required_feat_index(feat_two_1_idx_, r, "feat_two_1_idx_column");
+               const int u_i22 = optional_feat_index(feat_two_2_idx_, r, "feat_two_2_idx_column");
+               const int u_i23 = optional_feat_index(feat_two_3_idx_, r, "feat_two_3_idx_column");
+               const double alpha = alpha_col[r];
+
+               const double r_one = covariate(r, u_i11);
+               if (!is_nan(r_one)) {
+                 double sum_one = q[u_i11] + (u_i12 >= 0 ? q[u_i12] : 0.0) + (u_i13 >= 0 ? q[u_i13] : 0.0);
+                 double pe_one = r_one - sum_one;
+                 q[u_i11] += alpha * pe_one;
+                 if (u_i12 >= 0) q[u_i12] += alpha * pe_one;
+                 if (u_i13 >= 0) q[u_i13] += alpha * pe_one;
+               }
+               const double r_two = covariate(r, u_i21);
+               if (!is_nan(r_two)) {
+                 double sum_two = q[u_i21] + (u_i22 >= 0 ? q[u_i22] : 0.0) + (u_i23 >= 0 ? q[u_i23] : 0.0);
+                 double pe_two = r_two - sum_two;
+                 q[u_i21] += alpha * pe_two;
+                 if (u_i22 >= 0) q[u_i22] += alpha * pe_two;
+                 if (u_i23 >= 0) q[u_i23] += alpha * pe_two;
+               }
+
+               const int next_r = comp_idx[j + 1];
+               emit_row(j + 1, next_r, sat_single_col, sat_double_col, gamma_col, q);
+             }
+
+             mark_run_complete();
+           }
+
+  KernelOutput get_output_stream(int code) const override {
+    if (code != 1) {
+      Rcpp::stop("RwSatlinkGammaCard2chFfKernel::get_output_stream: unsupported code %d (1=AllocShape)", code);
+    }
+    if (n_elem_ <= 0) return KernelOutput{ q_mat_.data(), 0, 0 };
+    const int n_comp = static_cast<int>(q_mat_.size()) / n_elem_;
+    std::vector<double>& buf = stream_buf_[0];
+    if (has_expand_idx_) {
+      const int n_full = static_cast<int>(expand_idx_.size());
+      buf.resize(n_full * n_elem_);
+      for (int c = 0; c < n_elem_; ++c) {
+        for (int i = 0; i < n_full; ++i) {
+          int comp_row = expand_idx_[i] - 1;
+          buf[c * n_full + i] = q_mat_[comp_row * n_elem_ + c];
+        }
+      }
+      return KernelOutput{ buf.data(), n_full, n_elem_ };
+    }
+    buf.resize(n_comp * n_elem_);
+    for (int c = 0; c < n_elem_; ++c) {
+      for (int r = 0; r < n_comp; ++r) {
+        buf[c * n_comp + r] = q_mat_[r * n_elem_ + c];
+      }
+    }
+    return KernelOutput{ buf.data(), n_comp, n_elem_ };
+  }
+
+  std::string output_stream_name(int code) const override {
+    if (code == 1) return "AllocShape";
+    throw std::runtime_error("RwSatlinkGammaCard2chFfKernel::output_stream_name: unsupported code");
+  }
+};
+
+
 // ---- Type mapping + factory ----
 
 KernelType to_kernel_type(const Rcpp::String& k);
@@ -3227,4 +4848,3 @@ std::unique_ptr<BaseKernel> make_kernel(KernelType kt,
 
 
 #endif // KERNELS_H
-

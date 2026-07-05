@@ -18,7 +18,7 @@ is_multinomial_response_type <- function(x) {
 }
 
 is_choice_accumulator_type <- function(x) {
-  model_type(x) %in% c("ORDERED", "MULTINOMIAL", "RACE", "MT", "TC")
+  model_type(x) %in% c("ORDERED", "MULTINOMIAL", "RACE", "MT", "TC", "WINALL")
 }
 
 is_choice_only_model_type <- function(x) {

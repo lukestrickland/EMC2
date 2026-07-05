@@ -17,6 +17,9 @@
 
 // RaceSetup last — references functions defined in model headers above
 #include "RaceSetup.h"
+
+// Win-all / win-one feature-race RDM likelihoods (needs RaceSetup + model_RDM above)
+#include "winall.h"
 using namespace Rcpp;
 
 
@@ -603,6 +606,52 @@ NumericVector calc_ll(NumericMatrix particle_matrix, DataFrame data, NumericVect
       lls[i] = is_ar1 ? c_log_likelihood_MRI_white(pars, y, is_ok, n_trials, n_pars, min_ll)
         : c_log_likelihood_MRI(pars, y, is_ok, n_trials, n_pars, min_ll);
       }
+  // -----------------------------------------------------------------------
+  // Win-all / win-one feature-race RDM (variable per-feature accumulators)
+  // -----------------------------------------------------------------------
+  } else if (type == "WINALL_RDM" || type == "WINONE_RDM") {
+    const bool is_winone = (type == "WINONE_RDM");
+    NumericVector rts    = data["rt"];
+    LogicalVector winner = data["winner"];
+    // Reconstruct per-trial accumulator counts from the lR anchors (rows where the lR
+    // factor code == 1, i.e. the first level "opt1_f1"). The (per-subject) data is
+    // trial-contiguous with opt1_f1 first, so anchors mark trial starts and the
+    // run-lengths are the counts (2 Single, 4 Double). This is robust to the
+    // n_acc_per_trial attribute NOT surviving per-subject subsetting (plain `[` carries
+    // the full-data attribute onto each subject's slice -> a stale sum). compress = FALSE
+    // for these models, so expand is the identity (each trial contributes once).
+    IntegerVector lR_int = data["lR"];
+    if (lR_int.size() != n_trials)
+      Rcpp::stop("WIN feature RDM: lR length does not match data rows");
+    std::vector<int> anchor;
+    anchor.reserve(n_trials);
+    for (int r = 0; r < n_trials; ++r) if (lR_int[r] == 1) anchor.push_back(r);
+    const int n_actual = static_cast<int>(anchor.size());
+    if (n_actual == 0) Rcpp::stop("WIN feature RDM: no anchor rows (lR level 1) found");
+    IntegerVector n_acc_vec(n_actual);
+    for (int t = 0; t < n_actual; ++t) {
+      const int end = (t + 1 < n_actual) ? anchor[t + 1] : n_trials;
+      const int na  = end - anchor[t];
+      if (na <= 0) Rcpp::stop("WIN feature RDM: non-positive reconstructed accumulator count");
+      n_acc_vec[t] = na;
+    }
+    IntegerVector expand(n_actual);
+    for (int t = 0; t < n_actual; ++t) expand[t] = t + 1;
+    NumericVector ll_trial(n_actual);
+    RaceSpec spec = make_race_setup("RDM", ctx.param_table).spec;
+
+    for (int i = 0; i < n_particles; ++i) {
+      std::fill(is_ok.begin(), is_ok.end(), 1);
+      if (i > 0) ctx.param_table.fill_from_particle_row(ctx.particle_matrix, i, ctx.pm_col_to_base_idx);
+      run_pars_pipeline(ctx.param_table, designs, trend_runtime_ptr, cache);
+      c_do_bound_pt(ctx.param_table, bound_specs, is_ok);
+      lr_all_variable(is_ok, INTEGER(n_acc_vec), n_actual);
+      lls[i] = is_winone
+        ? c_log_likelihood_winone_rdm(ctx.param_table, spec, rts, winner, is_ok, expand,
+                                      min_ll, n_acc_vec, ll_trial)
+        : c_log_likelihood_winall_rdm(ctx.param_table, spec, rts, winner, is_ok, expand,
+                                      min_ll, n_acc_vec, ll_trial);
+    }
   // -----------------------------------------------------------------------
   // Race models (RDM, LBA, LNR)
   // -----------------------------------------------------------------------

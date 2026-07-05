@@ -1085,7 +1085,20 @@ get_data.emc <- function(emc) {
     names(dat) <- get_joint_names(emc)
   } else{
     design <- get_design(emc)[[1]]
+    is_winall <- is.function(design$model) && identical(design$model()$type, "WINALL")
     dat <- do.call(rbind,lapply(emc[[1]]$data,function(x){
+      if (is_winall && !is.null(x$winner) && !is.null(x$lR)) {
+        # Win-all/win-one: `winner` marks ALL of the chosen option's accumulators (2 rows on
+        # Double trials), so x[x$winner,] would keep >1 row/trial and the expand re-index then
+        # over-runs -> NA rows. Keep the FIRST winner row per trial instead; trials are
+        # delimited by lR level-1 anchors ("opt1_f1"), robust to n_acc_per_trial not surviving
+        # subsetting. This is already one row per trial, so no expand re-expansion is applied.
+        anchor <- which(as.integer(x$lR) == 1L)
+        trial_of_row <- rep(seq_along(anchor), times = diff(c(anchor, nrow(x) + 1L)))
+        win_idx <- which(as.logical(x$winner))
+        keep <- win_idx[!duplicated(trial_of_row[win_idx])]
+        return(x[keep, , drop = FALSE])
+      }
       if(!is.null(x$winner) && (length(unique(x$lR)) > 1)){
         # Only expand winner for race models
         x <- x[x$winner,]

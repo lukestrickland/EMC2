@@ -234,7 +234,8 @@ make_data <- function(parameters,design = NULL,n_trials=NULL,data=NULL,expand=1,
     trialwise_parameters <- res$trialwise_parameters
   } else {
     data <- design_model(
-      add_accumulators(data,design$matchfun,simulate=TRUE,type=model()$type,Fcovariates=design$Fcovariates),
+      add_accumulators(data,design$matchfun,simulate=TRUE,type=model()$type,Fcovariates=design$Fcovariates,
+                       custom_expand=model()$expand_accumulators),
       design,model,add_acc=FALSE,compress=FALSE,verbose=FALSE,
       rt_check=FALSE)
     pars <- get_pars_oo(parameters, data, model())

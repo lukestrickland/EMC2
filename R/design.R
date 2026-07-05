@@ -348,9 +348,16 @@ contr.anova <- function(n) {
   contr/rep(2*apply(abs(contr),2,max),each=dim(contr)[1])
 }
 
-add_accumulators <- function(data,matchfun=NULL,simulate=FALSE, type = "RACE", Fcovariates=NULL) {
+add_accumulators <- function(data,matchfun=NULL,simulate=FALSE, type = "RACE", Fcovariates=NULL,
+                             custom_expand=NULL) {
   if (!is_choice_accumulator_type(type)) return(data)
   if (!is.factor(data$R)) stop("data must have a factor R")
+  # WINALL / WINONE: delegate the (variable per-feature) expansion to the model.
+  if (type == "WINALL") {
+    if (is.null(custom_expand))
+      stop("WINALL type requires expand_accumulators in the model definition")
+    return(custom_expand(data, matchfun, simulate))
+  }
   factors <- names(data)[!names(data) %in% c("R","rt","trials",Fcovariates)]
   if (type == "RACE" || is_choice_only_model_type(type)) {
     nacc <- length(levels(data$R))
@@ -610,7 +617,8 @@ design_model <- function(data,design,model=NULL,
   if (!any(names(data)=="trials")) data$trials <- 1:dim(data)[1]
   if(rt_check){rt_check_function(data)}
   if (!add_acc) da <- data else
-    da <- add_accumulators(data,design$matchfun,type=model_type(model_info),Fcovariates=design$Fcovariates)
+    da <- add_accumulators(data,design$matchfun,type=model_type(model_info),Fcovariates=design$Fcovariates,
+                           custom_expand=model_info$expand_accumulators)
   order_idx <- order(da$subjects)
   da <- da[order_idx,] # fixes different sort in add_accumulators depending on subject type
 
