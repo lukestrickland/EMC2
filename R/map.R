@@ -43,6 +43,19 @@ do_pre_transform <- function(p_vector, transform)
 }
 
 
+# Broadcast a per-row ok flag to whole trials: a trial is ok only if ALL its
+# accumulator rows are. Trials are delimited by the lR anchor rows (first
+# factor level), which works for BOTH uniform designs (2 rows/trial RDM,
+# where it reproduces the old matrix(bound, lvl) reshape exactly) and
+# variable team sizes (win-all 2/4 rows; win-all-3 2/6 rows, 2026-07-06 --
+# the old reshape assumed uniform rows/trial and broke on mixed sizes).
+.bound_by_trial <- function(ok, lR) {
+  lR_fac <- if (is.factor(lR)) lR else factor(lR)
+  anchor <- as.character(lR_fac) == levels(lR_fac)[1L]
+  trial  <- cumsum(anchor)
+  as.logical(ave(ok, trial, FUN = function(x) all(x)))
+}
+
 # This form used in random number generation
 do_bound <- function(pars,bound, lR = NULL) {
   tpars <- t(pars[,colnames(bound$minmax),drop=FALSE])
@@ -52,8 +65,7 @@ do_bound <- function(pars,bound, lR = NULL) {
     (tpars[names(bound$exception),] == bound$exception)
   bound <- colSums(ok) == nrow(ok)
   if(!is.null(lR)){
-    lvl <- length(unique(lR))
-    bound <- rep(colSums(matrix(bound, lvl)) == lvl, each = lvl)
+    bound <- .bound_by_trial(bound, lR)
   }
   return(bound)
 }
@@ -85,8 +97,7 @@ fix_bound <- function(pars,bound, lR = NULL,fix=FALSE) {
   }
 
   if(!is.null(lR)){
-    lvl <- length(unique(lR))
-    bounds <- rep(colSums(matrix(bounds, lvl)) == lvl, each = lvl)
+    bounds <- .bound_by_trial(bounds, lR)
   }
   attr(pars,"ok") <- bounds
   return(pars)

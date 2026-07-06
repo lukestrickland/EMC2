@@ -85,19 +85,34 @@ log_likelihood_winone_R <- function(pars, dadm, model, min_ll = log(1e-10)) {
 }
 
 # ---- accumulator expansion (custom_expand hook target) ---------------------
-expand_accumulators_winall <- function(n_feat_per_option = "variable") {
+# cfg_accumulator = TRUE (2026-07-06, win-all-3): Double trials get a THIRD
+# accumulator per option (lR level f3) carrying the configural channel as its
+# own race member instead of a coactive drift term. Backward-compatible: the
+# default FALSE reproduces the original 4-level expansion byte-for-byte. The
+# f3 NAME (digits after _f) is required by the winner-regex below and by the
+# C++ team extraction. Only variable mode supports the flag. NB the rfun
+# FeatureCount fallback in .winall_n_acc_vec assumes 4 rows on Double; the
+# attr/lR paths (which always apply in practice) are team-size generic.
+expand_accumulators_winall <- function(n_feat_per_option = "variable",
+                                       cfg_accumulator = FALSE) {
   variable_mode <- identical(n_feat_per_option, "variable")
+  if (cfg_accumulator && !variable_mode)
+    stop("cfg_accumulator = TRUE requires n_feat_per_option = 'variable'")
   if (!variable_mode) {
     fixed_n_feat <- as.integer(n_feat_per_option)
     fixed_n_acc  <- 2L * fixed_n_feat
   }
-  all_lR_levels <- c("opt1_f1", "opt1_f2", "opt2_f1", "opt2_f2")
+  all_lR_levels <- if (cfg_accumulator)
+    c("opt1_f1", "opt1_f2", "opt1_f3", "opt2_f1", "opt2_f2", "opt2_f3")
+  else
+    c("opt1_f1", "opt1_f2", "opt2_f1", "opt2_f2")
 
   function(data, matchfun = NULL, simulate = FALSE) {
     n_data <- nrow(data)
     if (variable_mode) {
       fc        <- as.character(data$FeatureCount)
-      n_acc_vec <- ifelse(fc == "Double", 4L, 2L)
+      dbl_acc   <- if (cfg_accumulator) 6L else 4L
+      n_acc_vec <- ifelse(fc == "Double", dbl_acc, 2L)
     } else {
       n_acc_vec <- rep(fixed_n_acc, n_data)
     }
@@ -187,7 +202,7 @@ rfun_winall <- .winall_rfun(is_winone = FALSE)
 rfun_winone <- .winall_rfun(is_winone = TRUE)
 
 # ---- model factories --------------------------------------------------------
-.winall_model <- function(n_feat, c_name, rfun_maker, ll_R) {
+.winall_model <- function(n_feat, c_name, rfun_maker, ll_R, cfg_accumulator = FALSE) {
   list(
     type    = "WINALL",
     c_name  = c_name,
@@ -199,7 +214,7 @@ rfun_winone <- .winall_rfun(is_winone = TRUE)
       exception = c(A = 0, v = 0)
     ),
     Ttransform = function(pars, dadm) cbind(pars, b = pars[, "B"] + pars[, "A"]),
-    expand_accumulators = expand_accumulators_winall(n_feat),
+    expand_accumulators = expand_accumulators_winall(n_feat, cfg_accumulator),
     rfun                = rfun_maker(n_feat),
     dfun                = function(rt, pars) dRDM(rt, pars),
     pfun                = function(rt, pars) pRDM(rt, pars),
@@ -213,6 +228,21 @@ rfun_winone <- .winall_rfun(is_winone = TRUE)
 #' @export
 WINALL_RDM <- function(n_feat = "variable")
   .winall_model(n_feat, "WINALL_RDM", rfun_winall, log_likelihood_winall_R)
+
+#' Win-All Model with a Dedicated Configural Accumulator (win-all-3)
+#'
+#' As \code{WINALL_RDM}, but Double trials expand to THREE accumulators per
+#' option (lR levels f1/f2/f3): two feature accumulators plus a configural
+#' accumulator that races as its own team member (the configural channel is no
+#' longer a coactive drift term). Single trials are unchanged (one accumulator
+#' per option). Likelihood/simulation are shared with WINALL_RDM (team-size
+#' generic; c_name unchanged so the C++ dispatch is identical).
+#' @param n_feat Must be "variable" (FeatureCount-driven expansion).
+#' @return A model list for use in \code{design()}.
+#' @export
+WINALL3_RDM <- function(n_feat = "variable")
+  .winall_model(n_feat, "WINALL_RDM", rfun_winall, log_likelihood_winall_R,
+                cfg_accumulator = TRUE)
 
 #' Win-One Feature-Accumulator Model (RDM family)
 #' @param n_feat Integer or "variable" (default: reads FeatureCount per trial).
