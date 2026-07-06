@@ -227,8 +227,14 @@ make_data <- function(parameters,design = NULL,n_trials=NULL,data=NULL,expand=1,
   pars <- t(apply(parameters, 1, do_pre_transform, model()$pre_transform))
   pars <- add_constants(pars,design$constants)
   if(simulate_unconditional_on_data) {
+    # n_context_trials: how many PREVIOUS trials the per-trial Ffunction re-evaluation
+    # sees during sequential simulation (default 1 preserves historical behaviour).
+    # History-dependent covariates (e.g. within-pair perseveration lags) need a window
+    # covering their full lookback -- pass n_context_trials=<N> through predict()'s dots.
+    n_ctx <- if (!is.null(optionals$n_context_trials)) as.integer(optionals$n_context_trials) else 1L
     res <- make_data_unconditional(data=data, pars=pars, design=design, model=model,
-                                   return_trialwise_parameters, kernel_output_codes, optionals=optionals)
+                                   return_trialwise_parameters, kernel_output_codes, optionals=optionals,
+                                   n_context_trials = n_ctx)
 
     data <- res$data
     trialwise_parameters <- res$trialwise_parameters
