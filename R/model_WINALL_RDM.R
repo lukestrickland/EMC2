@@ -281,3 +281,171 @@ WINALL3P_RDM <- function(n_feat = "variable")
 #' @export
 WINONE_RDM <- function(n_feat = "variable")
   .winall_model(n_feat, "WINONE_RDM", rfun_winone, log_likelihood_winone_R)
+
+# ---- win-all-3 PERSEVERATION variants (2026-07-07) ---------------------------
+# Both keep the win-all-3 race and add a NON-accumulation-coupled repeat
+# process driven by the persev_own dadm column (row-level indicator of the
+# previously-chosen option; all-zero on first encounters):
+#   MIX: discrete mixture -- with prob p_rep the response comes from a LONE
+#        repeat accumulator (same B/A/t0/s as the trial's anchor row, own
+#        drift v_rep): L = (1-p)*L_race + p*1[R==prev]*d_rep(t).
+#   OVR: first-past-the-post override racer (own drift v_ovr) racing the
+#        whole race: L = L_race*(1-P_ovr) + 1[R==prev]*d_ovr*S_race, with
+#        S_race = (1-prod_p_win)(1-prod_p_los) (neither option complete).
+# Nesting: p_rep -> 0 / v_ovr -> 0 recover the plain win-all-3 likelihood.
+# C++ twins: c_log_likelihood_winall3_persev_rdm (src/winall.h), dispatched by
+# c_name WINALL3MIX_RDM / WINALL3OVR_RDM.
+log_likelihood_winall3_persev_R <- function(is_mix) {
+  force(is_mix)
+  function(pars, dadm, model, min_ll = log(1e-10)) {
+    anchor <- which(as.integer(dadm$lR) == 1L)
+    if (length(anchor) == 0L) stop("WINALL3 persev variant: no anchor rows found")
+    n_acc_per_trial <- diff(c(anchor, nrow(dadm) + 1L))
+    n_comp <- length(n_acc_per_trial)
+
+    d_all  <- model$dfun(dadm$rt, pars)
+    p_all  <- model$pfun(dadm$rt, pars)
+    winner <- dadm$winner
+    persev <- dadm$persev_own
+    ok     <- if (is.null(attr(pars, "ok"))) rep(TRUE, nrow(dadm)) else attr(pars, "ok")
+
+    # lone/override accumulator: anchor-row pars with v replaced by the extra drift
+    pars_x <- pars[anchor, , drop = FALSE]
+    pars_x[, "v"] <- pars_x[, if (is_mix) "v_rep" else "v_ovr"]
+    d_x <- model$dfun(dadm$rt[anchor], pars_x)
+    p_x <- model$pfun(dadm$rt[anchor], pars_x)
+
+    ll_trial  <- numeric(n_comp)
+    row_start <- 1L
+    for (t in seq_len(n_comp)) {
+      na  <- n_acc_per_trial[t]
+      idx <- row_start:(row_start + na - 1L)
+      row_start <- row_start + na
+      if (!ok[idx[1L]]) { ll_trial[t] <- min_ll; next }
+
+      w          <- winner[idx]
+      p_t        <- p_all[idx]
+      d_t        <- d_all[idx]
+      prod_p_win <- prod(p_t[w])
+      prod_p_los <- prod(p_t[!w])
+      p_win      <- p_t[w]
+      density_max <- sum(d_t[w] * ifelse(p_win > 1e-300, prod_p_win / p_win, 0))
+      L_race      <- density_max * (1 - prod_p_los)
+
+      pv         <- persev[idx]
+      has_prev   <- any(pv > 0.5)
+      rep_chosen <- any(pv > 0.5 & w)
+      L <- L_race
+      if (has_prev) {
+        if (is_mix) {
+          pr <- pars[idx[1L], "p_rep"]
+          L  <- (1 - pr) * L_race + if (rep_chosen) pr * d_x[t] else 0
+        } else {
+          S_race <- (1 - prod_p_win) * (1 - prod_p_los)
+          L      <- L_race * (1 - p_x[t]) + if (rep_chosen) d_x[t] * S_race else 0
+        }
+      }
+      ll <- log(L)
+      ll_trial[t] <- if (is.finite(ll)) ll else min_ll
+    }
+    sum(pmax(min_ll, ll_trial))
+  }
+}
+
+# Simulation: base win-all-3 race sim plus the repeat process. The extra drifts
+# are divided by s exactly as the member drifts are; the repeat/override
+# accumulator borrows the trial's scaled B/A and raw t0 from the anchor row.
+.winall3_persev_rfun <- function(is_mix) {
+  force(is_mix)
+  function(n_feat_per_option = "variable") {
+    variable_mode <- identical(n_feat_per_option, "variable")
+    fixed_n_acc   <- if (!variable_mode) 2L * as.integer(n_feat_per_option) else NA_integer_
+    function(data = NULL, pars) {
+      n_rows    <- nrow(pars)
+      n_acc_vec <- .winall_n_acc_vec(data, pars, variable_mode, fixed_n_acc)
+      n_trial   <- length(n_acc_vec)
+
+      s_col <- if (any(dimnames(pars)[[2]] == "s")) pars[, "s"] else rep(1, n_rows)
+      pars_adj <- pars
+      pars_adj[, c("A", "B", "v")] <- pars_adj[, c("A", "B", "v")] / s_col
+      pars_adj[, "B"][pars_adj[, "B"] < 0] <- 0
+      pars_adj[, "A"][pars_adj[, "A"] < 0] <- 0
+
+      ok <- attr(pars, "ok")
+      if (is.null(ok)) ok <- rep(TRUE, n_rows)
+      finish     <- rep(Inf, n_rows)
+      finish[ok] <- rWald(sum(ok), B = pars_adj[ok, "B"],
+                          v = pars_adj[ok, "v"], A = pars_adj[ok, "A"])
+      abs_times  <- finish + pars[, "t0"]
+
+      persev <- data$persev_own
+      if (is.null(persev)) stop("WINALL3 persev variant rfun: data lacks persev_own")
+
+      winner_idx <- integer(n_trial)
+      rt_vec     <- numeric(n_trial)
+      pars_row   <- 1L
+      for (i in seq_len(n_trial)) {
+        na   <- n_acc_vec[i]; nf <- na / 2L
+        idx  <- pars_row:(pars_row + na - 1L)
+        opt1 <- idx[seq_len(nf)]
+        opt2 <- idx[(nf + 1L):na]
+        t1 <- max(abs_times[opt1]); t2 <- max(abs_times[opt2])
+        R_i  <- if (t1 <= t2) 1L else 2L
+        rt_i <- min(t1, t2)
+
+        pv <- persev[idx]
+        if (any(pv > 0.5)) {
+          prev_opt <- if (any(pv[seq_len(nf)] > 0.5)) 1L else 2L
+          a0 <- idx[1L]
+          v_x <- pars[a0, if (is_mix) "v_rep" else "v_ovr"] / s_col[a0]
+          if (is_mix) {
+            if (stats::runif(1) < pars[a0, "p_rep"]) {
+              R_i  <- prev_opt
+              rt_i <- pars[a0, "t0"] +
+                rWald(1, B = pars_adj[a0, "B"], v = v_x, A = pars_adj[a0, "A"])
+            }
+          } else {
+            t_ovr <- pars[a0, "t0"] +
+              rWald(1, B = pars_adj[a0, "B"], v = v_x, A = pars_adj[a0, "A"])
+            if (t_ovr < rt_i) { R_i <- prev_opt; rt_i <- t_ovr }
+          }
+        }
+        winner_idx[i] <- R_i
+        rt_vec[i]     <- rt_i
+        pars_row      <- pars_row + na
+      }
+      R_levels <- levels(data$R)
+      data.frame(R = factor(R_levels[winner_idx], levels = R_levels), rt = rt_vec)
+    }
+  }
+}
+
+.winall3_persev_variant_list <- function(n_feat, is_mix) {
+  m <- .winall_model(n_feat,
+                     if (is_mix) "WINALL3MIX_RDM" else "WINALL3OVR_RDM",
+                     .winall3_persev_rfun(is_mix),
+                     log_likelihood_winall3_persev_R(is_mix),
+                     cfg_accumulator = TRUE)
+  if (is_mix) {
+    m$p_types <- c(m$p_types, v_rep = log(1), p_rep = stats::qnorm(0.1))
+    m$transform$func <- c(m$transform$func, v_rep = "exp", p_rep = "pnorm")
+  } else {
+    m$p_types <- c(m$p_types, v_ovr = log(1))
+    m$transform$func <- c(m$transform$func, v_ovr = "exp")
+  }
+  m
+}
+
+#' Win-All-3 + repeat MIXTURE (RDM family)
+#' @param n_feat Integer or "variable" (default: reads FeatureCount per trial).
+#' @return A model list for use in \code{design()}.
+#' @export
+WINALL3MIX_RDM <- function(n_feat = "variable")
+  .winall3_persev_variant_list(n_feat, is_mix = TRUE)
+
+#' Win-All-3 + OVERRIDE repeat racer (RDM family)
+#' @param n_feat Integer or "variable" (default: reads FeatureCount per trial).
+#' @return A model list for use in \code{design()}.
+#' @export
+WINALL3OVR_RDM <- function(n_feat = "variable")
+  .winall3_persev_variant_list(n_feat, is_mix = FALSE)

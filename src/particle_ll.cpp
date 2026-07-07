@@ -653,6 +653,48 @@ NumericVector calc_ll(NumericMatrix particle_matrix, DataFrame data, NumericVect
                                       min_ll, n_acc_vec, ll_trial);
     }
   // -----------------------------------------------------------------------
+  // Win-all-3 perseveration variants: repeat MIXTURE / OVERRIDE racer.
+  // Same race + anchor reconstruction as WINALL_RDM, plus the persev_own dadm
+  // column and one/two extra ParamTable columns (v_rep+p_rep | v_ovr).
+  // -----------------------------------------------------------------------
+  } else if (type == "WINALL3MIX_RDM" || type == "WINALL3OVR_RDM") {
+    const bool is_mix    = (type == "WINALL3MIX_RDM");
+    NumericVector rts    = data["rt"];
+    LogicalVector winner = data["winner"];
+    NumericVector persev = data["persev_own"];
+    IntegerVector lR_int = data["lR"];
+    if (lR_int.size() != n_trials)
+      Rcpp::stop("WINALL3 persev variant: lR length does not match data rows");
+    std::vector<int> anchor;
+    anchor.reserve(n_trials);
+    for (int r = 0; r < n_trials; ++r) if (lR_int[r] == 1) anchor.push_back(r);
+    const int n_actual = static_cast<int>(anchor.size());
+    if (n_actual == 0) Rcpp::stop("WINALL3 persev variant: no anchor rows found");
+    IntegerVector n_acc_vec(n_actual);
+    for (int t = 0; t < n_actual; ++t) {
+      const int end = (t + 1 < n_actual) ? anchor[t + 1] : n_trials;
+      const int na  = end - anchor[t];
+      if (na <= 0) Rcpp::stop("WINALL3 persev variant: non-positive accumulator count");
+      n_acc_vec[t] = na;
+    }
+    IntegerVector expand(n_actual);
+    for (int t = 0; t < n_actual; ++t) expand[t] = t + 1;
+    NumericVector ll_trial(n_actual);
+    RaceSpec spec = make_race_setup("RDM", ctx.param_table).spec;
+    const int col_v_extra = ctx.param_table.base_index_for(is_mix ? "v_rep" : "v_ovr");
+    const int col_p_rep   = is_mix ? ctx.param_table.base_index_for("p_rep") : -1;
+
+    for (int i = 0; i < n_particles; ++i) {
+      std::fill(is_ok.begin(), is_ok.end(), 1);
+      if (i > 0) ctx.param_table.fill_from_particle_row(ctx.particle_matrix, i, ctx.pm_col_to_base_idx);
+      run_pars_pipeline(ctx.param_table, designs, trend_runtime_ptr, cache);
+      c_do_bound_pt(ctx.param_table, bound_specs, is_ok);
+      lr_all_variable(is_ok, INTEGER(n_acc_vec), n_actual);
+      lls[i] = c_log_likelihood_winall3_persev_rdm(
+        is_mix, ctx.param_table, spec, col_v_extra, col_p_rep,
+        rts, winner, persev, is_ok, expand, min_ll, n_acc_vec, ll_trial);
+    }
+  // -----------------------------------------------------------------------
   // Race models (RDM, LBA, LNR)
   // -----------------------------------------------------------------------
   } else {
