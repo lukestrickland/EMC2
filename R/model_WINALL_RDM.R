@@ -94,15 +94,26 @@ log_likelihood_winone_R <- function(pars, dadm, model, min_ll = log(1e-10)) {
 # FeatureCount fallback in .winall_n_acc_vec assumes 4 rows on Double; the
 # attr/lR paths (which always apply in practice) are team-size generic.
 expand_accumulators_winall <- function(n_feat_per_option = "variable",
-                                       cfg_accumulator = FALSE) {
+                                       cfg_accumulator = FALSE,
+                                       persev_accumulator = FALSE) {
+  # persev_accumulator = TRUE (2026-07-07, win-all-3 + choose-stay member):
+  # Double teams additionally race a PERSEVERATION accumulator, lR level f9
+  # (digits required by the winner regex; f9 avoids colliding with value-dim
+  # levels). Single trials unchanged. Requires cfg_accumulator (built for the
+  # win-all-3 architecture).
   variable_mode <- identical(n_feat_per_option, "variable")
   if (cfg_accumulator && !variable_mode)
     stop("cfg_accumulator = TRUE requires n_feat_per_option = 'variable'")
+  if (persev_accumulator && !cfg_accumulator)
+    stop("persev_accumulator = TRUE requires cfg_accumulator = TRUE")
   if (!variable_mode) {
     fixed_n_feat <- as.integer(n_feat_per_option)
     fixed_n_acc  <- 2L * fixed_n_feat
   }
-  all_lR_levels <- if (cfg_accumulator)
+  all_lR_levels <- if (persev_accumulator)
+    c("opt1_f1", "opt1_f2", "opt1_f3", "opt1_f9",
+      "opt2_f1", "opt2_f2", "opt2_f3", "opt2_f9")
+  else if (cfg_accumulator)
     c("opt1_f1", "opt1_f2", "opt1_f3", "opt2_f1", "opt2_f2", "opt2_f3")
   else
     c("opt1_f1", "opt1_f2", "opt2_f1", "opt2_f2")
@@ -111,12 +122,16 @@ expand_accumulators_winall <- function(n_feat_per_option = "variable",
     n_data <- nrow(data)
     if (variable_mode) {
       fc        <- as.character(data$FeatureCount)
-      dbl_acc   <- if (cfg_accumulator) 6L else 4L
+      dbl_acc   <- if (persev_accumulator) 8L else if (cfg_accumulator) 6L else 4L
       n_acc_vec <- ifelse(fc == "Double", dbl_acc, 2L)
     } else {
       n_acc_vec <- rep(fixed_n_acc, n_data)
     }
     make_lR <- function(na) {
+      if (na == 8L) {
+        one <- c("f1", "f2", "f3", "f9")
+        return(c(paste0("opt1_", one), paste0("opt2_", one)))
+      }
       nf <- na / 2L
       c(paste0("opt1_f", seq_len(nf)), paste0("opt2_f", seq_len(nf)))
     }
@@ -202,7 +217,8 @@ rfun_winall <- .winall_rfun(is_winone = FALSE)
 rfun_winone <- .winall_rfun(is_winone = TRUE)
 
 # ---- model factories --------------------------------------------------------
-.winall_model <- function(n_feat, c_name, rfun_maker, ll_R, cfg_accumulator = FALSE) {
+.winall_model <- function(n_feat, c_name, rfun_maker, ll_R, cfg_accumulator = FALSE,
+                          persev_accumulator = FALSE) {
   list(
     type    = "WINALL",
     c_name  = c_name,
@@ -214,7 +230,8 @@ rfun_winone <- .winall_rfun(is_winone = TRUE)
       exception = c(A = 0, v = 0)
     ),
     Ttransform = function(pars, dadm) cbind(pars, b = pars[, "B"] + pars[, "A"]),
-    expand_accumulators = expand_accumulators_winall(n_feat, cfg_accumulator),
+    expand_accumulators = expand_accumulators_winall(n_feat, cfg_accumulator,
+                                                     persev_accumulator),
     rfun                = rfun_maker(n_feat),
     dfun                = function(rt, pars) dRDM(rt, pars),
     pfun                = function(rt, pars) pRDM(rt, pars),
@@ -243,6 +260,20 @@ WINALL_RDM <- function(n_feat = "variable")
 WINALL3_RDM <- function(n_feat = "variable")
   .winall_model(n_feat, "WINALL_RDM", rfun_winall, log_likelihood_winall_R,
                 cfg_accumulator = TRUE)
+
+#' Win-All-3 + choose-stay accumulator (RDM family)
+#'
+#' Win-all-3 (configural accumulator, lR f3) with an additional PERSEVERATION
+#' accumulator per option on Double trials (lR f9): the previously-chosen
+#' option's member idles fast (does not bind) while the switch team's member
+#' runs at baseline (binds) -- choice bias without repeat speed-up. Single
+#' trials unchanged.
+#' @param n_feat Integer or "variable" (default: reads FeatureCount per trial).
+#' @return A model list for use in \code{design()}.
+#' @export
+WINALL3P_RDM <- function(n_feat = "variable")
+  .winall_model(n_feat, "WINALL_RDM", rfun_winall, log_likelihood_winall_R,
+                cfg_accumulator = TRUE, persev_accumulator = TRUE)
 
 #' Win-One Feature-Accumulator Model (RDM family)
 #' @param n_feat Integer or "variable" (default: reads FeatureCount per trial).
