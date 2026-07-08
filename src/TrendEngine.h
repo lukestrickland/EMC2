@@ -62,6 +62,13 @@ struct KernelSpec {
   // rw_satlink_gamma_card hybrid: optional 3rd cue (configural compound) index per option
   std::vector<int> feat_one_3_idx_col;
   std::vector<int> feat_two_3_idx_col;
+  // delta_satlink_gamma_card_elemseed: constituent-feature index columns (into the
+  // elem_* shadow block) + elemental feature count n_feat
+  std::vector<int> elem_one_1_idx_col;
+  std::vector<int> elem_one_2_idx_col;
+  std::vector<int> elem_two_1_idx_col;
+  std::vector<int> elem_two_2_idx_col;
+  int              n_feat_arg = -1;
   // delta_expdecr / delta_satlink_gamma_card_expdecr: within-block 0-based exposure count
   std::vector<double> block_trial_col;
   int              n_elem_arg = -1;
@@ -89,8 +96,13 @@ struct KernelSpec {
     if (!feat_two_2_idx_col.empty()) kernel_args.feat_two_2_idx = feat_two_2_idx_col.data();
     if (!feat_one_3_idx_col.empty()) kernel_args.feat_one_3_idx = feat_one_3_idx_col.data();
     if (!feat_two_3_idx_col.empty()) kernel_args.feat_two_3_idx = feat_two_3_idx_col.data();
+    if (!elem_one_1_idx_col.empty()) kernel_args.elem_one_1_idx = elem_one_1_idx_col.data();
+    if (!elem_one_2_idx_col.empty()) kernel_args.elem_one_2_idx = elem_one_2_idx_col.data();
+    if (!elem_two_1_idx_col.empty()) kernel_args.elem_two_1_idx = elem_two_1_idx_col.data();
+    if (!elem_two_2_idx_col.empty()) kernel_args.elem_two_2_idx = elem_two_2_idx_col.data();
     if (!block_trial_col.empty()) kernel_args.block_trial = block_trial_col.data();
     kernel_args.n_elem = n_elem_arg;
+    kernel_args.n_feat = n_feat_arg;
   }
 };
 

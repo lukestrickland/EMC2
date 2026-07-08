@@ -36,6 +36,17 @@ struct KernelArgs {
   const int* feat_one_3_idx = nullptr;
   const int* feat_two_3_idx = nullptr;
   int n_elem = -1;               // number of elemental (covariate) Q columns
+  // delta_satlink_gamma_card_elemseed: per-trial 1-based indices (into the SECOND
+  // covariate block, the elem_* feature feedback) of each option's constituent
+  // features; used to seed a compound's configural Q at its first presentation from
+  // the mean of its elements' shadow-tracked elemental Qs. n_feat = number of
+  // elemental feature columns (the second covariate block; the first n_elem columns
+  // are the compound cfg_* feedback).
+  const int* elem_one_1_idx = nullptr;
+  const int* elem_one_2_idx = nullptr;
+  const int* elem_two_1_idx = nullptr;
+  const int* elem_two_2_idx = nullptr;
+  int n_feat = -1;               // number of elemental (feature) shadow-Q columns
   // delta_expdecr / delta_satlink_gamma_card_expdecr: within-block 0-based exposure
   // count driving the exp-decreasing learning rate alpha_eff(t).
   const double* block_trial = nullptr;
@@ -74,6 +85,7 @@ enum class KernelType {
   Custom,
   RescorlaWagner,
   DeltaSatlinkGammaCard,
+  DeltaSatlinkGammaCardElemseed,
   DeltaSatlinkDimCard,
   DeltaNoisyOrCard,
   RwNoisyOrCard,
@@ -120,6 +132,7 @@ inline KernelMeta kernel_meta(KernelType kt) {
   case KernelType::Custom: return{1, false};
   case KernelType::RescorlaWagner: return{-1, false};  // N columns allowed
   case KernelType::DeltaSatlinkGammaCard:
+  case KernelType::DeltaSatlinkGammaCardElemseed:
   case KernelType::DeltaSatlinkDimCard:
   case KernelType::DeltaNoisyOrCard:
   case KernelType::RwNoisyOrCard:
@@ -1970,6 +1983,279 @@ public:
   std::string output_stream_name(int code) const override {
     if (code == 1) return "AllocShape";
     throw std::runtime_error("DeltaSatlinkGammaCardKernel::output_stream_name: unsupported code");
+  }
+};
+
+
+// =============================================================================
+// DeltaSatlinkGammaCardElemseedKernel — configural cardsat read-out (delta) with
+// an ELEMENTAL-AVERAGE SEED at first compound presentation.
+//
+// Identical to DeltaSatlinkGammaCardKernel (learns one Q per COMPOUND label, forms
+// the directional difference D = q_cfg[cmp_one] - q_cfg[cmp_two], applies the same
+// cardinality-selected saturating link, emits the same AllocShape [g, -g, 0, ...]
+// team stream), with ONE structural difference and NO new parameter:
+//
+//   The kernel also SHADOW-TRACKS the elemental feature Qs (an independent delta
+//   learner over the elem_* feedback, using the SAME q0/alpha as the configural
+//   channel -- which the hybrid ties by name, so the shadow reproduces the real
+//   elemental channel's Q exactly). On the FIRST presentation of a compound within
+//   a block, that compound's configural Q is INITIALISED to the mean of its two
+//   constituent features' current elemental Qs (instead of q0). Learning then
+//   proceeds by delta from the seeded value. This gives one-shot elemental transfer
+//   to a never-seen compound whose ELEMENTS have accrued value. When the elements
+//   are themselves unseen their Q is q0, so the seed is q0 and the kernel is
+//   BYTE-IDENTICAL to delta_satlink_gamma_card -> the champion is the elements-cold
+//   limit (no free parameter distinguishes them; a discrete model comparison).
+//
+// Covariate layout (single Mat): the first n_elem columns are the compound cfg_*
+// feedback; the next n_feat columns are the elemental feature elem_* feedback.
+// Compound indices arrive via the feat_*_1 idx columns (as delta_satlink_gamma_card;
+// feat_*_2 are the sat-cardinality dummy). Feature indices arrive via NEW
+// elem_*_idx columns (into the elem block). Output width = n_elem + n_feat (= n_covs)
+// so the existing team selector map, sized to the kernel's cov_names, routes column 0.
+// Parameters: q0, alpha, sat_single, sat_double, gamma (shared, by name, with the
+// elemental / sum channels of the hybrid).
+// =============================================================================
+struct DeltaSatlinkGammaCardElemseedKernel : SequentialKernel {
+private:
+  int n_cfg_  = 0;   // compound Q count   = first covariate block
+  int n_feat_ = 0;   // elemental Q count  = second covariate block
+  int n_covs_ = 0;   // total covariate cols = output stream width = n_cfg_ + n_feat_
+
+  const int* q_reset_ = nullptr;
+  // compound (configural-Q) index columns, 1-based into the cfg block
+  const int* cmp_one_1_idx_ = nullptr;
+  const int* cmp_one_2_idx_ = nullptr;   // sat-cardinality dummy (see gamma card)
+  const int* cmp_two_1_idx_ = nullptr;
+  const int* cmp_two_2_idx_ = nullptr;   // sat-cardinality dummy
+  // constituent-feature index columns, 1-based into the elem (shadow-Q) block
+  const int* elem_one_1_idx_ = nullptr;
+  const int* elem_one_2_idx_ = nullptr;
+  const int* elem_two_1_idx_ = nullptr;
+  const int* elem_two_2_idx_ = nullptr;
+  int arg_n_cfg_  = -1;
+  int arg_n_feat_ = -1;
+
+  std::vector<double> q_mat_;   // [n_comp x n_covs_], row-major: [g, -g, 0, ...]
+
+  static double sat_link(double d, double theta, double gamma) {
+    double dpow = d;
+    if (!is_nan(gamma) && gamma > 0.0 && gamma != 1.0) {
+      const double ad = std::fabs(d);
+      dpow = (d < 0.0 ? -1.0 : 1.0) * std::pow(ad, gamma);
+    }
+    if (is_nan(theta) || theta <= 0.0) return dpow;
+    if (theta > 1e6) return dpow;
+    return theta * std::tanh(dpow / theta);
+  }
+
+  int required_idx(const int* arr, int row, int size, const char* arg_name) const {
+    if (!arr)
+      Rcpp::stop("DeltaSatlinkGammaCardElemseedKernel requires kernel_args$%s", arg_name);
+    const int value = arr[row];
+    if (value == NA_INTEGER || value <= 0)
+      Rcpp::stop("DeltaSatlinkGammaCardElemseedKernel requires kernel_args$%s[%d] to be a positive 1-based index",
+                 arg_name, row + 1);
+    const int idx = value - 1;
+    if (idx < 0 || idx >= size)
+      Rcpp::stop("DeltaSatlinkGammaCardElemseedKernel kernel_args$%s[%d]=%d is outside 1:%d",
+                 arg_name, row + 1, value, size);
+    return idx;
+  }
+
+  int optional_idx(const int* arr, int row, int size, const char* arg_name) const {
+    if (!arr) return -1;
+    const int value = arr[row];
+    if (value == NA_INTEGER || value <= 0) return -1;
+    const int idx = value - 1;
+    if (idx < 0 || idx >= size)
+      Rcpp::stop("DeltaSatlinkGammaCardElemseedKernel kernel_args$%s[%d]=%d is outside 1:%d",
+                 arg_name, row + 1, value, size);
+    return idx;
+  }
+
+  // On the first presentation of a genuine two-feature compound (both element
+  // indices present), set its configural Q to the mean of its elements' shadow
+  // elemental Qs. Single-trial slots (second feature absent) never seed and never
+  // mark seen. Idempotent per compound within a block.
+  void seed_compound(int c, const int* ef1_arr, const int* ef2_arr, int row,
+                     std::vector<double>& q_cfg,
+                     const std::vector<double>& q_elem,
+                     std::vector<char>& seen_cfg) {
+    if (c < 0 || c >= n_cfg_) return;
+    const int ef1 = optional_idx(ef1_arr, row, n_feat_, "elem_one_1_idx_column");
+    const int ef2 = optional_idx(ef2_arr, row, n_feat_, "elem_one_2_idx_column");
+    if (ef1 < 0 || ef2 < 0) return;      // not a two-feature (Double) presentation
+    if (seen_cfg[c]) return;             // already seeded / learned this block
+    seen_cfg[c] = 1;
+    q_cfg[c] = 0.5 * (q_elem[ef1] + q_elem[ef2]);
+  }
+
+  void seed_and_emit_row(int j, int r,
+                         const double* sat_single_col, const double* sat_double_col,
+                         const double* gamma_col,
+                         std::vector<double>& q_cfg,
+                         const std::vector<double>& q_elem,
+                         std::vector<char>& seen_cfg) {
+    const int c1  = required_idx(cmp_one_1_idx_, r, n_cfg_, "feat_one_1_idx_column");
+    const int c1b = optional_idx(cmp_one_2_idx_, r, n_cfg_, "feat_one_2_idx_column");
+    const int c2  = required_idx(cmp_two_1_idx_, r, n_cfg_, "feat_two_1_idx_column");
+    const int c2b = optional_idx(cmp_two_2_idx_, r, n_cfg_, "feat_two_2_idx_column");
+
+    // Seed BEFORE reading: a first-seen compound is read at its seeded value.
+    seed_compound(c1, elem_one_1_idx_, elem_one_2_idx_, r, q_cfg, q_elem, seen_cfg);
+    seed_compound(c2, elem_two_1_idx_, elem_two_2_idx_, r, q_cfg, q_elem, seen_cfg);
+
+    const double q11 = q_cfg[c1];
+    const double q12 = (c1b >= 0) ? q_cfg[c1b] : 0.0;
+    const double q21 = q_cfg[c2];
+    const double q22 = (c2b >= 0) ? q_cfg[c2b] : 0.0;
+    const double d = (q11 + q12) - (q21 + q22);   // dummy *_2 slot cancels
+
+    const bool two_item = (c1b >= 0) || (c2b >= 0);
+    const double sat = two_item ? sat_double_col[r] : sat_single_col[r];
+    const double g = sat_link(d, sat, gamma_col[r]);
+
+    double* row_out = &q_mat_[j * n_covs_];
+    row_out[0] =  g;
+    row_out[1] = -g;
+    for (int c = 2; c < n_covs_; ++c) row_out[c] = 0.0;
+  }
+
+public:
+  void set_kernel_args(const KernelArgs& args) override {
+    q_reset_        = args.q_reset;
+    cmp_one_1_idx_  = args.feat_one_1_idx;
+    cmp_one_2_idx_  = args.feat_one_2_idx;
+    cmp_two_1_idx_  = args.feat_two_1_idx;
+    cmp_two_2_idx_  = args.feat_two_2_idx;
+    elem_one_1_idx_ = args.elem_one_1_idx;
+    elem_one_2_idx_ = args.elem_one_2_idx;
+    elem_two_1_idx_ = args.elem_two_1_idx;
+    elem_two_2_idx_ = args.elem_two_2_idx;
+    arg_n_cfg_      = args.n_elem;
+    arg_n_feat_     = args.n_feat;
+  }
+
+  void reset() override {
+    BaseKernel::reset();
+    q_mat_.clear();
+    n_cfg_  = 0;
+    n_feat_ = 0;
+    n_covs_ = 0;
+  }
+
+  void run(const KernelParsView& kernel_pars,
+           const Mat& covariate,
+           const std::vector<int>& comp_idx) override {
+             if (kernel_pars.cols.size() != 5 && kernel_pars.cols.size() != 6) {
+               Rcpp::stop("DeltaSatlinkGammaCardElemseedKernel expects 5 parameter columns (q0, alpha, sat_single, sat_double, gamma) or 6 (+ alpha_elem for the shadow learner), got %d",
+                          (int)kernel_pars.cols.size());
+             }
+
+             const int n_comp = static_cast<int>(comp_idx.size());
+             n_covs_ = covariate.ncol;
+             n_cfg_  = arg_n_cfg_;
+             n_feat_ = arg_n_feat_;
+
+             if (n_comp == 0 || n_covs_ == 0) {
+               q_mat_.clear();
+               mark_run_complete();
+               return;
+             }
+
+             if (n_cfg_ < 2)
+               Rcpp::stop("DeltaSatlinkGammaCardElemseedKernel requires kernel_args$n_elem >= 2 (compound Q columns); got %d", n_cfg_);
+             if (n_feat_ < 1)
+               Rcpp::stop("DeltaSatlinkGammaCardElemseedKernel requires kernel_args$n_feat >= 1 (elemental Q columns); got %d", n_feat_);
+             if (n_covs_ != n_cfg_ + n_feat_)
+               Rcpp::stop("DeltaSatlinkGammaCardElemseedKernel requires covariate columns (%d) to equal n_elem + n_feat (%d + %d)",
+                          n_covs_, n_cfg_, n_feat_);
+             if (!cmp_one_1_idx_ || !cmp_two_1_idx_)
+               Rcpp::stop("DeltaSatlinkGammaCardElemseedKernel requires kernel_args$feat_one_1_idx_column and kernel_args$feat_two_1_idx_column");
+             if (!elem_one_1_idx_ || !elem_one_2_idx_ || !elem_two_1_idx_ || !elem_two_2_idx_)
+               Rcpp::stop("DeltaSatlinkGammaCardElemseedKernel requires kernel_args$elem_one_1/one_2/two_1/two_2_idx_column");
+
+             const double* q0_col         = kernel_pars.cols[0];
+             const double* alpha_col      = kernel_pars.cols[1];   // configural-Q learning rate
+             const double* sat_single_col = kernel_pars.cols[2];
+             const double* sat_double_col = kernel_pars.cols[3];
+             const double* gamma_col      = kernel_pars.cols[4];
+             // Optional 6th column: a SEPARATE learning rate for the shadow elemental Q, so the
+             // shadow matches a decoupled (faster) elemental channel. Falls back to alpha if absent.
+             const double* alpha_elem_col = (kernel_pars.cols.size() == 6) ? kernel_pars.cols[5] : alpha_col;
+
+             const int row0 = comp_idx[0];
+             std::vector<double> q_cfg(n_cfg_,  q0_col[row0]);
+             std::vector<double> q_elem(n_feat_, q0_col[row0]);
+             std::vector<char>   seen_cfg(n_cfg_, 0);
+             q_mat_.assign(n_comp * n_covs_, 0.0);
+
+             seed_and_emit_row(0, row0, sat_single_col, sat_double_col, gamma_col,
+                               q_cfg, q_elem, seen_cfg);
+
+             for (int j = 0; j < n_comp - 1; ++j) {
+               const int r = comp_idx[j];
+
+               if (q_reset_ && q_reset_[r] == 1) {
+                 std::fill(q_cfg.begin(),  q_cfg.end(),  q0_col[r]);
+                 std::fill(q_elem.begin(), q_elem.end(), q0_col[r]);
+                 std::fill(seen_cfg.begin(), seen_cfg.end(), (char)0);
+                 seed_and_emit_row(j, r, sat_single_col, sat_double_col, gamma_col,
+                                   q_cfg, q_elem, seen_cfg);
+               }
+
+               const double alpha      = alpha_col[r];        // configural rate
+               const double alpha_elem = alpha_elem_col[r];   // shadow elemental rate (= alpha if 5-param)
+               // configural Q update (first n_cfg_ covariate columns = cfg_* feedback)
+               for (int c = 0; c < n_cfg_; ++c) {
+                 const double x = covariate(r, c);
+                 if (!is_nan(x)) q_cfg[c] += alpha * (x - q_cfg[c]);
+               }
+               // shadow elemental Q update (next n_feat_ columns = elem_* feedback) at alpha_elem
+               for (int e = 0; e < n_feat_; ++e) {
+                 const double x = covariate(r, n_cfg_ + e);
+                 if (!is_nan(x)) q_elem[e] += alpha_elem * (x - q_elem[e]);
+               }
+
+               const int next_r = comp_idx[j + 1];
+               seed_and_emit_row(j + 1, next_r, sat_single_col, sat_double_col, gamma_col,
+                                 q_cfg, q_elem, seen_cfg);
+             }
+
+             mark_run_complete();
+           }
+
+  KernelOutput get_output_stream(int code) const override {
+    if (code != 1)
+      Rcpp::stop("DeltaSatlinkGammaCardElemseedKernel::get_output_stream: unsupported code %d (1=AllocShape)", code);
+    if (n_covs_ <= 0) return KernelOutput{ q_mat_.data(), 0, 0 };
+
+    const int n_comp = static_cast<int>(q_mat_.size()) / n_covs_;
+    std::vector<double>& buf = stream_buf_[0];
+
+    if (has_expand_idx_) {
+      const int n_full = static_cast<int>(expand_idx_.size());
+      buf.resize(n_full * n_covs_);
+      for (int c = 0; c < n_covs_; ++c)
+        for (int i = 0; i < n_full; ++i) {
+          int comp_row = expand_idx_[i] - 1;
+          buf[c * n_full + i] = q_mat_[comp_row * n_covs_ + c];
+        }
+      return KernelOutput{ buf.data(), n_full, n_covs_ };
+    }
+
+    buf.resize(n_comp * n_covs_);
+    for (int c = 0; c < n_covs_; ++c)
+      for (int r = 0; r < n_comp; ++r)
+        buf[c * n_comp + r] = q_mat_[r * n_covs_ + c];
+    return KernelOutput{ buf.data(), n_comp, n_covs_ };
+  }
+
+  std::string output_stream_name(int code) const override {
+    if (code == 1) return "AllocShape";
+    throw std::runtime_error("DeltaSatlinkGammaCardElemseedKernel::output_stream_name: unsupported code");
   }
 };
 

@@ -18,7 +18,10 @@ KernelType to_kernel_type(const Rcpp::String& k) {
   if (k == "custom")       return KernelType::Custom;
   if (k == "rescorlawagner")       return KernelType::RescorlaWagner;
   if (k == "delta_satlink_gamma_card") return KernelType::DeltaSatlinkGammaCard;
+  if (k == "delta_satlink_gamma_card_elemseed") return KernelType::DeltaSatlinkGammaCardElemseed;
+  if (k == "delta_satlink_gamma_card_elemseed_2a") return KernelType::DeltaSatlinkGammaCardElemseed;  // 6-param: separate alpha_elem for the shadow learner
   if (k == "delta_satlink_dim_card") return KernelType::DeltaSatlinkDimCard;
+  if (k == "delta_satlink_dim_card_aelem") return KernelType::DeltaSatlinkDimCard;  // alias: alpha renamed alpha_elem (R-side) to decouple the elemental learning rate
   if (k == "delta_noisyor_card") return KernelType::DeltaNoisyOrCard;
   if (k == "rw_noisyor_card") return KernelType::RwNoisyOrCard;
   if (k == "delta_satlink_gamma_card_expdecr") return KernelType::DeltaSatlinkGammaCardExpdecr;
@@ -59,6 +62,7 @@ std::unique_ptr<BaseKernel> make_kernel(KernelType kt, SEXP custom_fun) {
   case KernelType::Poly4:       return std::unique_ptr<BaseKernel>(new Poly4Kernel());
   case KernelType::RescorlaWagner:     return std::unique_ptr<BaseKernel>(new RescorlaWagnerKernel());
   case KernelType::DeltaSatlinkGammaCard: return std::unique_ptr<BaseKernel>(new DeltaSatlinkGammaCardKernel());
+  case KernelType::DeltaSatlinkGammaCardElemseed: return std::unique_ptr<BaseKernel>(new DeltaSatlinkGammaCardElemseedKernel());
   case KernelType::DeltaSatlinkDimCard: return std::unique_ptr<BaseKernel>(new DeltaSatlinkDimCardKernel());
   case KernelType::DeltaNoisyOrCard: return std::unique_ptr<BaseKernel>(new DeltaNoisyOrCardKernel());
   case KernelType::RwNoisyOrCard: return std::unique_ptr<BaseKernel>(new RwNoisyOrCardKernel());

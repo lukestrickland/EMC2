@@ -292,11 +292,19 @@ WINONE_RDM <- function(n_feat = "variable")
 #   OVR: first-past-the-post override racer (own drift v_ovr) racing the
 #        whole race: L = L_race*(1-P_ovr) + 1[R==prev]*d_ovr*S_race, with
 #        S_race = (1-prod_p_win)(1-prod_p_los) (neither option complete).
+#   SWAP: label-capture mixture -- with prob p_rep the race runs as normal but
+#        the emitted response LABEL is the previous within-pair choice; the RT
+#        is the race's own finish time regardless of which option won:
+#        L = (1-p)*L_race + p*1[R==prev]*f_race(t), f_race = the race's
+#        MARGINAL finish density (observed-response likelihood + the exact
+#        role swap). No extra accumulator, no v_* parameter: the repeat
+#        process is RT-silent by construction (port of the flat-API
+#        RDM_REPEAT_CHOICE design to win-all-3).
 # Nesting: p_rep -> 0 / v_ovr -> 0 recover the plain win-all-3 likelihood.
 # C++ twins: c_log_likelihood_winall3_persev_rdm (src/winall.h), dispatched by
-# c_name WINALL3MIX_RDM / WINALL3OVR_RDM.
-log_likelihood_winall3_persev_R <- function(is_mix) {
-  force(is_mix)
+# c_name WINALL3MIX_RDM / WINALL3OVR_RDM / WINALL3SWAP_RDM.
+log_likelihood_winall3_persev_R <- function(mode) {
+  mode <- match.arg(mode, c("mix", "ovr", "swap"))
   function(pars, dadm, model, min_ll = log(1e-10)) {
     anchor <- which(as.integer(dadm$lR) == 1L)
     if (length(anchor) == 0L) stop("WINALL3 persev variant: no anchor rows found")
@@ -309,11 +317,14 @@ log_likelihood_winall3_persev_R <- function(is_mix) {
     persev <- dadm$persev_own
     ok     <- if (is.null(attr(pars, "ok"))) rep(TRUE, nrow(dadm)) else attr(pars, "ok")
 
-    # lone/override accumulator: anchor-row pars with v replaced by the extra drift
-    pars_x <- pars[anchor, , drop = FALSE]
-    pars_x[, "v"] <- pars_x[, if (is_mix) "v_rep" else "v_ovr"]
-    d_x <- model$dfun(dadm$rt[anchor], pars_x)
-    p_x <- model$pfun(dadm$rt[anchor], pars_x)
+    # lone/override accumulator: anchor-row pars with v replaced by the extra
+    # drift. The swap variant has NO extra accumulator -- skip entirely.
+    if (mode != "swap") {
+      pars_x <- pars[anchor, , drop = FALSE]
+      pars_x[, "v"] <- pars_x[, if (mode == "mix") "v_rep" else "v_ovr"]
+      d_x <- model$dfun(dadm$rt[anchor], pars_x)
+      p_x <- model$pfun(dadm$rt[anchor], pars_x)
+    }
 
     ll_trial  <- numeric(n_comp)
     row_start <- 1L
@@ -337,9 +348,15 @@ log_likelihood_winall3_persev_R <- function(is_mix) {
       rep_chosen <- any(pv > 0.5 & w)
       L <- L_race
       if (has_prev) {
-        if (is_mix) {
+        if (mode == "mix") {
           pr <- pars[idx[1L], "p_rep"]
           L  <- (1 - pr) * L_race + if (rep_chosen) pr * d_x[t] else 0
+        } else if (mode == "swap") {
+          p_los <- p_t[!w]
+          density_max_los <- sum(d_t[!w] * ifelse(p_los > 1e-300, prod_p_los / p_los, 0))
+          f_race <- L_race + density_max_los * (1 - prod_p_win)
+          pr <- pars[idx[1L], "p_rep"]
+          L  <- (1 - pr) * L_race + if (rep_chosen) pr * f_race else 0
         } else {
           S_race <- (1 - prod_p_win) * (1 - prod_p_los)
           L      <- L_race * (1 - p_x[t]) + if (rep_chosen) d_x[t] * S_race else 0
@@ -353,10 +370,13 @@ log_likelihood_winall3_persev_R <- function(is_mix) {
 }
 
 # Simulation: base win-all-3 race sim plus the repeat process. The extra drifts
-# are divided by s exactly as the member drifts are; the repeat/override
-# accumulator borrows the trial's scaled B/A and raw t0 from the anchor row.
-.winall3_persev_rfun <- function(is_mix) {
-  force(is_mix)
+# (mix/ovr) are divided by s exactly as the member drifts are; the repeat/
+# override accumulator borrows the trial's scaled B/A and raw t0 from the
+# anchor row. The swap variant draws NO extra finishing time: with prob p_rep
+# the response label is overwritten with the previous within-pair choice and
+# the race's RT is kept unchanged.
+.winall3_persev_rfun <- function(mode) {
+  mode <- match.arg(mode, c("mix", "ovr", "swap"))
   function(n_feat_per_option = "variable") {
     variable_mode <- identical(n_feat_per_option, "variable")
     fixed_n_acc   <- if (!variable_mode) 2L * as.integer(n_feat_per_option) else NA_integer_
@@ -397,17 +417,22 @@ log_likelihood_winall3_persev_R <- function(is_mix) {
         if (any(pv > 0.5)) {
           prev_opt <- if (any(pv[seq_len(nf)] > 0.5)) 1L else 2L
           a0 <- idx[1L]
-          v_x <- pars[a0, if (is_mix) "v_rep" else "v_ovr"] / s_col[a0]
-          if (is_mix) {
-            if (stats::runif(1) < pars[a0, "p_rep"]) {
-              R_i  <- prev_opt
-              rt_i <- pars[a0, "t0"] +
-                rWald(1, B = pars_adj[a0, "B"], v = v_x, A = pars_adj[a0, "A"])
-            }
+          if (mode == "swap") {
+            # label capture: response overwritten, race RT untouched
+            if (stats::runif(1) < pars[a0, "p_rep"]) R_i <- prev_opt
           } else {
-            t_ovr <- pars[a0, "t0"] +
-              rWald(1, B = pars_adj[a0, "B"], v = v_x, A = pars_adj[a0, "A"])
-            if (t_ovr < rt_i) { R_i <- prev_opt; rt_i <- t_ovr }
+            v_x <- pars[a0, if (mode == "mix") "v_rep" else "v_ovr"] / s_col[a0]
+            if (mode == "mix") {
+              if (stats::runif(1) < pars[a0, "p_rep"]) {
+                R_i  <- prev_opt
+                rt_i <- pars[a0, "t0"] +
+                  rWald(1, B = pars_adj[a0, "B"], v = v_x, A = pars_adj[a0, "A"])
+              }
+            } else {
+              t_ovr <- pars[a0, "t0"] +
+                rWald(1, B = pars_adj[a0, "B"], v = v_x, A = pars_adj[a0, "A"])
+              if (t_ovr < rt_i) { R_i <- prev_opt; rt_i <- t_ovr }
+            }
           }
         }
         winner_idx[i] <- R_i
@@ -420,15 +445,30 @@ log_likelihood_winall3_persev_R <- function(is_mix) {
   }
 }
 
-.winall3_persev_variant_list <- function(n_feat, is_mix) {
+.winall3_persev_variant_list <- function(n_feat, mode, cfg_accumulator = TRUE) {
+  mode <- match.arg(mode, c("mix", "ovr", "swap"))
+  if (!cfg_accumulator && mode != "swap")
+    stop("cfg_accumulator = FALSE is only supported for the swap variant")
+  # The C++ likelihood (c_log_likelihood_winall3_persev_rdm) is team-size
+  # generic -- it reconstructs per-trial accumulator counts from the lR
+  # anchors -- so the 2-leg (champion-architecture) swap reuses the installed
+  # WINALL3SWAP_RDM dispatch string, exactly as WINALL3_RDM reuses the
+  # WINALL_RDM c_name. Only the expansion differs (cfg_accumulator).
+  c_name <- switch(mode,
+                   mix  = "WINALL3MIX_RDM",
+                   ovr  = "WINALL3OVR_RDM",
+                   swap = "WINALL3SWAP_RDM")
   m <- .winall_model(n_feat,
-                     if (is_mix) "WINALL3MIX_RDM" else "WINALL3OVR_RDM",
-                     .winall3_persev_rfun(is_mix),
-                     log_likelihood_winall3_persev_R(is_mix),
-                     cfg_accumulator = TRUE)
-  if (is_mix) {
+                     c_name,
+                     .winall3_persev_rfun(mode),
+                     log_likelihood_winall3_persev_R(mode),
+                     cfg_accumulator = cfg_accumulator)
+  if (mode == "mix") {
     m$p_types <- c(m$p_types, v_rep = log(1), p_rep = stats::qnorm(0.1))
     m$transform$func <- c(m$transform$func, v_rep = "exp", p_rep = "pnorm")
+  } else if (mode == "swap") {
+    m$p_types <- c(m$p_types, p_rep = stats::qnorm(0.1))
+    m$transform$func <- c(m$transform$func, p_rep = "pnorm")
   } else {
     m$p_types <- c(m$p_types, v_ovr = log(1))
     m$transform$func <- c(m$transform$func, v_ovr = "exp")
@@ -441,11 +481,39 @@ log_likelihood_winall3_persev_R <- function(is_mix) {
 #' @return A model list for use in \code{design()}.
 #' @export
 WINALL3MIX_RDM <- function(n_feat = "variable")
-  .winall3_persev_variant_list(n_feat, is_mix = TRUE)
+  .winall3_persev_variant_list(n_feat, mode = "mix")
 
 #' Win-All-3 + OVERRIDE repeat racer (RDM family)
 #' @param n_feat Integer or "variable" (default: reads FeatureCount per trial).
 #' @return A model list for use in \code{design()}.
 #' @export
 WINALL3OVR_RDM <- function(n_feat = "variable")
-  .winall3_persev_variant_list(n_feat, is_mix = FALSE)
+  .winall3_persev_variant_list(n_feat, mode = "ovr")
+
+#' Win-All-3 + repeat LABEL-SWAP mixture (RDM family)
+#'
+#' Label-capture repeat mixture: with probability \code{p_rep} the race runs
+#' exactly as normal but the emitted response is the previous within-pair
+#' choice, with the RT taken from the race's own finish time regardless of
+#' which option won (the marginal finish density in the likelihood). The
+#' repeat process is therefore RT-silent by construction; \code{p_rep -> 0}
+#' nests the plain win-all-3 race. No extra accumulator or drift parameter.
+#' @param n_feat Integer or "variable" (default: reads FeatureCount per trial).
+#' @return A model list for use in \code{design()}.
+#' @export
+WINALL3SWAP_RDM <- function(n_feat = "variable")
+  .winall3_persev_variant_list(n_feat, mode = "swap")
+
+#' Win-All + repeat LABEL-SWAP mixture (RDM family; champion 2-leg architecture)
+#'
+#' The label-swap repeat mixture of \code{WINALL3SWAP_RDM} on the plain
+#' win-all expansion (no configural accumulator; 4 rows on Double, 2 on
+#' Single) -- i.e. the capture process added on top of the champion
+#' architecture, where configural evidence enters as a team-wide drift
+#' contribution. Same likelihood dispatch (team-size generic); only the
+#' expansion differs. \code{p_rep -> 0} nests the plain win-all race.
+#' @param n_feat Integer or "variable" (default: reads FeatureCount per trial).
+#' @return A model list for use in \code{design()}.
+#' @export
+WINALLSWAP_RDM <- function(n_feat = "variable")
+  .winall3_persev_variant_list(n_feat, mode = "swap", cfg_accumulator = FALSE)

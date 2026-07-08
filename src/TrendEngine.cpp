@@ -165,6 +165,11 @@ static void build_kernel_args(KernelSpec& ks,
   ks.feat_two_2_idx_col.clear();
   ks.feat_one_3_idx_col.clear();
   ks.feat_two_3_idx_col.clear();
+  ks.elem_one_1_idx_col.clear();
+  ks.elem_one_2_idx_col.clear();
+  ks.elem_two_1_idx_col.clear();
+  ks.elem_two_2_idx_col.clear();
+  ks.n_feat_arg = -1;
   ks.block_trial_col.clear();
   ks.n_elem_arg = -1;
 
@@ -201,6 +206,11 @@ static void build_kernel_args(KernelSpec& ks,
   parse_idx_column(ka, "feat_two_2_idx_column", data, ks.feat_two_2_idx_col);
   parse_idx_column(ka, "feat_one_3_idx_column", data, ks.feat_one_3_idx_col);
   parse_idx_column(ka, "feat_two_3_idx_column", data, ks.feat_two_3_idx_col);
+  // delta_satlink_gamma_card_elemseed: constituent-feature index columns (elem block)
+  parse_idx_column(ka, "elem_one_1_idx_column", data, ks.elem_one_1_idx_col);
+  parse_idx_column(ka, "elem_one_2_idx_column", data, ks.elem_one_2_idx_col);
+  parse_idx_column(ka, "elem_two_1_idx_column", data, ks.elem_two_1_idx_col);
+  parse_idx_column(ka, "elem_two_2_idx_column", data, ks.elem_two_2_idx_col);
   // delta_expdecr / delta_satlink_gamma_card_expdecr: within-block 0-based exposure count (double)
   if (ka.containsElementNamed("block_trial_column")) {
     SEXP cns = ka["block_trial_column"];
@@ -225,6 +235,10 @@ static void build_kernel_args(KernelSpec& ks,
   if (ka.containsElementNamed("n_elem")) {
     SEXP ne = ka["n_elem"];
     if (!Rf_isNull(ne)) ks.n_elem_arg = Rcpp::as<int>(ne);
+  }
+  if (ka.containsElementNamed("n_feat")) {
+    SEXP nf = ka["n_feat"];
+    if (!Rf_isNull(nf)) ks.n_feat_arg = Rcpp::as<int>(nf);
   }
   ks.build_kernel_args();
 }

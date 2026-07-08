@@ -1088,6 +1088,31 @@ get_kernels <- function() {
               sequential   = TRUE,
               n_outputs    = 1L,
               NA_allowed=TRUE),
+  delta_satlink_gamma_card_elemseed = list(description = paste(
+                "Cardinality-saturation satlink read-out (delta) with an ELEMENTAL-AVERAGE\n",
+                "         SEED. Identical to delta_satlink_gamma_card (learns one Q per COMPOUND\n",
+                "         covariate, directional D, cardinality sat, AllocShape [g, -g, 0, ...]) but\n",
+                "         also SHADOW-TRACKS the elemental feature Qs and, on the FIRST presentation\n",
+                "         of a compound within a block, initialises that compound's Q to the mean of\n",
+                "         its constituent features' elemental Qs (instead of q0). Gives one-shot\n",
+                "         elemental transfer to a never-seen compound whose elements have accrued\n",
+                "         value; nests delta_satlink_gamma_card BYTE-IDENTICALLY when the elements are\n",
+                "         themselves unseen (their Q = q0 -> seed = q0). No new parameter.\n",
+                "         Covariate layout: first n_elem columns = compound cfg_* feedback; next\n",
+                "         n_feat columns = elemental feature elem_* feedback. Requires kernel_args:\n",
+                "         n_elem, n_feat, feat_one_1_idx_column, feat_two_1_idx_column (compound\n",
+                "         indices; + optional feat_*_2 sat-cardinality dummy), elem_one_1/one_2/two_1/\n",
+                "         two_2_idx_column (feature indices into the elem block), and optional\n",
+                "         q_reset_column. Parameters: q0, alpha, sat_single, sat_double, gamma."
+              ),
+              default_pars = c("q0", "alpha", "sat_single", "sat_double", "gamma"),
+              transforms = list(func = list("q0" = "plogis", "alpha" = "pnorm",
+                                            "sat_single" = "exp", "sat_double" = "exp",
+                                            "gamma" = "exp")),
+              bases = base_2p,
+              sequential   = TRUE,
+              n_outputs    = 1L,
+              NA_allowed=TRUE),
   delta_satlink_dim_card = list(description = paste(
                 "Per-DIMENSION cardinality-saturation satlink read-out (delta).\n",
                 "         Same learning + cardsat sat-selection as delta_satlink_gamma_card, but the\n",
@@ -1103,6 +1128,38 @@ get_kernels <- function() {
               transforms = list(func = list("q0" = "plogis", "alpha" = "pnorm",
                                             "sat_single" = "exp", "sat_double" = "exp",
                                             "gamma" = "exp")),
+              bases = base_2p,
+              sequential   = TRUE,
+              n_outputs    = 1L,
+              NA_allowed=TRUE),
+  delta_satlink_dim_card_aelem = list(description = paste(
+                "delta_satlink_dim_card with the learning rate renamed alpha_elem, to DECOUPLE the\n",
+                "         elemental learning rate from the configural channel (which keeps alpha). Identical\n",
+                "         C++ (positional params); only the R-side parameter NAME differs, so it maps to a\n",
+                "         distinct sampled parameter v.alpha_elem. Same kernel_args as delta_satlink_dim_card.\n",
+                "         Parameters: q0, alpha_elem, sat_single, sat_double, gamma."
+              ),
+              default_pars = c("q0", "alpha_elem", "sat_single", "sat_double", "gamma"),
+              transforms = list(func = list("q0" = "plogis", "alpha_elem" = "pnorm",
+                                            "sat_single" = "exp", "sat_double" = "exp",
+                                            "gamma" = "exp")),
+              bases = base_2p,
+              sequential   = TRUE,
+              n_outputs    = 1L,
+              NA_allowed=TRUE),
+  delta_satlink_gamma_card_elemseed_2a = list(description = paste(
+                "delta_satlink_gamma_card_elemseed with a SEPARATE shadow-elemental learning rate\n",
+                "         alpha_elem (6th parameter). The configural Q learns at alpha; the shadow elemental\n",
+                "         learner (whose per-compound mean seeds the configural Q at first presentation)\n",
+                "         learns at alpha_elem, so the seed reflects a DECOUPLED (faster) elemental channel.\n",
+                "         alpha_elem == alpha recovers delta_satlink_gamma_card_elemseed exactly. Same\n",
+                "         kernel_args (n_elem, n_feat, compound + elem index columns). Parameters:\n",
+                "         q0, alpha, sat_single, sat_double, gamma, alpha_elem."
+              ),
+              default_pars = c("q0", "alpha", "sat_single", "sat_double", "gamma", "alpha_elem"),
+              transforms = list(func = list("q0" = "plogis", "alpha" = "pnorm",
+                                            "sat_single" = "exp", "sat_double" = "exp",
+                                            "gamma" = "exp", "alpha_elem" = "pnorm")),
               bases = base_2p,
               sequential   = TRUE,
               n_outputs    = 1L,
@@ -1812,6 +1869,14 @@ make_data_unconditional <- function(data, pars, design, model,
   constants   <- attr(dadm_full, "constants")
   if (is.null(constants)) constants <- NA
 
+  # Optional CHOICE-CLAMP hook (proof-of-concept intervention). If optionals$clamp_fun is a
+  # function, it is called after each trial's choice is simulated with (dadm_current, pr) --
+  # the current trial's per-accumulator rows and their parameter matrix (drift v, etc.) -- and
+  # may return a single replacement R level (applied to every row of that trial) or NULL for no
+  # change. Because the loop is sequential and the clamped choice drives feedback + learning,
+  # this lets you test how a forced early choice propagates through the simulated trajectory.
+  clamp_fun <- if (is.list(optionals)) optionals$clamp_fun else NULL
+
   for (subj in subj_levels) {
     sub_trialwise_parameters <- NULL
     subj_mask <- dadm_full$subjects == subj
@@ -1995,6 +2060,12 @@ make_data_unconditional <- function(data, pars, design, model,
       }
 
       dadm_subj_df[[R_col]][idx_curr]  <- Rrt[, "R"]
+      # CHOICE-CLAMP hook: override the simulated choice on flagged trials (feeds forward into
+      # feedback + learning below). clamp_fun returns a single R level or NULL (no change).
+      if (!is.null(clamp_fun)) {
+        clamped_R <- clamp_fun(dadm_current, pr)
+        if (!is.null(clamped_R)) dadm_subj_df[[R_col]][idx_curr] <- clamped_R
+      }
       # Choice-only models (e.g. multinomial_logit / softmax) simulate R but no rt, so their
       # rfun returns no "rt" column. Guard the assignment (dadm$rt stays NA, set at line ~1482).
       if ("rt" %in% colnames(Rrt)) {

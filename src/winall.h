@@ -152,6 +152,15 @@ inline double c_log_likelihood_winall_rdm(
 //   racing the whole win-all race: L = L_race*(1-P_ovr(t))
 //   + 1[R==prev]*d_ovr(t)*S_race(t), where S_race = (1-prod_p_win)(1-prod_p_los)
 //   (neither option complete; options independent). No prev: L_race.
+// SWAP ("WINALL3SWAP_RDM"): label-capture mixture (2026-07-07 evening). With
+//   prob p_rep the race runs EXACTLY as normal but the emitted response LABEL
+//   is the previous within-pair choice; the RT is the race's own finish time
+//   REGARDLESS of which option won: L = (1-p)*L_race
+//   + p*1[R==prev]*f_race(t), with f_race(t) = L_race(opt A wins, t)
+//   + L_race(opt B wins, t) the race's MARGINAL finish density (the two win
+//   events partition the finish event). No new RT process, no extra
+//   accumulator, no v_* parameter -- the repeat process is RT-silent by
+//   construction (port of the flat-API RDM_REPEAT_CHOICE design to win-all-3).
 // Nesting: p_rep -> 0 and v_ovr -> 0 recover the win-all-3 likelihood.
 // ---------------------------------------------------------------------------
 inline void rdm_dp_single(double t_eff, double A, double B, double s, double v,
@@ -169,11 +178,11 @@ inline void rdm_dp_single(double t_eff, double A, double B, double s, double v,
 }
 
 inline double c_log_likelihood_winall3_persev_rdm(
-    const bool               is_mix,
+    const int                mode,          // 0 = MIX, 1 = OVR, 2 = SWAP
     const ParamTable&        pt,
     const RaceSpec&          spec,
-    const int                col_v_extra,   // v_rep (mix) or v_ovr (ovr)
-    const int                col_p_rep,     // mix only; -1 for ovr
+    const int                col_v_extra,   // v_rep (mix) / v_ovr (ovr); -1 for swap
+    const int                col_p_rep,     // mix/swap; -1 for ovr
     const NumericVector&     rts,
     const LogicalVector&     winner,
     const NumericVector&     persev,
@@ -208,8 +217,8 @@ inline double c_log_likelihood_winall3_persev_rdm(
   const double* B_col  = &pt.base(0, spec.col_B);
   const double* t0_col = &pt.base(0, spec.col_t0);
   const double* s_col  = &pt.base(0, spec.col_s);
-  const double* v_ext  = &pt.base(0, col_v_extra);
-  const double* p_rep  = (col_p_rep >= 0) ? &pt.base(0, col_p_rep) : nullptr;
+  const double* v_ext  = (col_v_extra >= 0) ? &pt.base(0, col_v_extra) : nullptr;
+  const double* p_rep  = (col_p_rep   >= 0) ? &pt.base(0, col_p_rep)   : nullptr;
 
   int base = 0;
   for (int t = 0; t < n_actual; ++t) {
@@ -234,16 +243,31 @@ inline double c_log_likelihood_winall3_persev_rdm(
 
     double L = L_race;
     if (has_prev) {
-      const int    i0    = base;
-      const double t_eff = rts[i0] - t0_col[i0];
-      double d_x = 0.0, p_x = 0.0;
-      rdm_dp_single(t_eff, A_col[i0], B_col[i0], s_col[i0], v_ext[i0], d_x, p_x);
-      if (is_mix) {
+      const int i0 = base;
+      if (mode == 2) {
+        // SWAP: no new RT process. f_race = observed-response likelihood plus
+        // the exact role swap (loser-team win density * winner-team survivor);
+        // reuses the d/p values already computed for every row.
+        double density_max_los = 0.0;
+        for (int k = 0; k < na; ++k) {
+          const int i = base + k;
+          if (!win_flag[i] && p_all[i] > 1e-300)
+            density_max_los += d_all[i] * (prod_p_los / p_all[i]);
+        }
+        const double f_race = L_race + density_max_los * (1.0 - prod_p_win);
         const double pr = p_rep[i0];
-        L = (1.0 - pr) * L_race + (rep_chosen ? pr * d_x : 0.0);
+        L = (1.0 - pr) * L_race + (rep_chosen ? pr * f_race : 0.0);
       } else {
-        const double S_race = (1.0 - prod_p_win) * (1.0 - prod_p_los);
-        L = L_race * (1.0 - p_x) + (rep_chosen ? d_x * S_race : 0.0);
+        const double t_eff = rts[i0] - t0_col[i0];
+        double d_x = 0.0, p_x = 0.0;
+        rdm_dp_single(t_eff, A_col[i0], B_col[i0], s_col[i0], v_ext[i0], d_x, p_x);
+        if (mode == 0) {
+          const double pr = p_rep[i0];
+          L = (1.0 - pr) * L_race + (rep_chosen ? pr * d_x : 0.0);
+        } else {
+          const double S_race = (1.0 - prod_p_win) * (1.0 - prod_p_los);
+          L = L_race * (1.0 - p_x) + (rep_chosen ? d_x * S_race : 0.0);
+        }
       }
     }
     const double ll = std::log(L);

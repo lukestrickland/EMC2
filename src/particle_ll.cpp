@@ -653,12 +653,15 @@ NumericVector calc_ll(NumericMatrix particle_matrix, DataFrame data, NumericVect
                                       min_ll, n_acc_vec, ll_trial);
     }
   // -----------------------------------------------------------------------
-  // Win-all-3 perseveration variants: repeat MIXTURE / OVERRIDE racer.
-  // Same race + anchor reconstruction as WINALL_RDM, plus the persev_own dadm
-  // column and one/two extra ParamTable columns (v_rep+p_rep | v_ovr).
+  // Win-all-3 perseveration variants: repeat MIXTURE / OVERRIDE racer /
+  // label-SWAP mixture. Same race + anchor reconstruction as WINALL_RDM, plus
+  // the persev_own dadm column and the variant's extra ParamTable columns
+  // (mix: v_rep+p_rep | ovr: v_ovr | swap: p_rep only).
   // -----------------------------------------------------------------------
-  } else if (type == "WINALL3MIX_RDM" || type == "WINALL3OVR_RDM") {
-    const bool is_mix    = (type == "WINALL3MIX_RDM");
+  } else if (type == "WINALL3MIX_RDM" || type == "WINALL3OVR_RDM" ||
+             type == "WINALL3SWAP_RDM") {
+    const int persev_mode = (type == "WINALL3MIX_RDM") ? 0
+                          : (type == "WINALL3OVR_RDM") ? 1 : 2;
     NumericVector rts    = data["rt"];
     LogicalVector winner = data["winner"];
     NumericVector persev = data["persev_own"];
@@ -681,8 +684,10 @@ NumericVector calc_ll(NumericMatrix particle_matrix, DataFrame data, NumericVect
     for (int t = 0; t < n_actual; ++t) expand[t] = t + 1;
     NumericVector ll_trial(n_actual);
     RaceSpec spec = make_race_setup("RDM", ctx.param_table).spec;
-    const int col_v_extra = ctx.param_table.base_index_for(is_mix ? "v_rep" : "v_ovr");
-    const int col_p_rep   = is_mix ? ctx.param_table.base_index_for("p_rep") : -1;
+    const int col_v_extra = (persev_mode == 2) ? -1
+      : ctx.param_table.base_index_for(persev_mode == 0 ? "v_rep" : "v_ovr");
+    const int col_p_rep   = (persev_mode == 1) ? -1
+      : ctx.param_table.base_index_for("p_rep");
 
     for (int i = 0; i < n_particles; ++i) {
       std::fill(is_ok.begin(), is_ok.end(), 1);
@@ -691,7 +696,7 @@ NumericVector calc_ll(NumericMatrix particle_matrix, DataFrame data, NumericVect
       c_do_bound_pt(ctx.param_table, bound_specs, is_ok);
       lr_all_variable(is_ok, INTEGER(n_acc_vec), n_actual);
       lls[i] = c_log_likelihood_winall3_persev_rdm(
-        is_mix, ctx.param_table, spec, col_v_extra, col_p_rep,
+        persev_mode, ctx.param_table, spec, col_v_extra, col_p_rep,
         rts, winner, persev, is_ok, expand, min_ll, n_acc_vec, ll_trial);
     }
   // -----------------------------------------------------------------------
