@@ -123,6 +123,20 @@ this extra condition. The \code{sample} proposals are then built and fixed.
 
 \code{iter} (integer): The number of MCMC samples to collect.
 
+\code{max_flat_loc} (numeric, \code{sample} stage only): Stationarity criterion. For every
+column in \code{flat_selection}, the absolute difference between the median of the first
+\code{flat_p1} and last \code{flat_p2} proportion of \code{sample} draws (chains pooled), divided
+by the column's IQR, must be at most \code{max_flat_loc} (e.g. 0.25). Default \code{NULL} (off).
+
+\code{flat_selection} (character vector): Which draws \code{max_flat_loc} applies to, any of
+\code{"alpha"}, \code{"subj_ll"}, \code{"theta_mu"}, \code{"theta_var"}. Default \code{c("alpha", "subj_ll", "theta_mu")}.
+
+\code{flat_p1}, \code{flat_p2} (numeric in (0, 1]): Proportions of draws compared by \code{max_flat_loc}. Default 1/3 each.
+
+\code{max_sample_iter} (integer >= 10, \code{sample} stage only): Keep only the most recent
+\code{max_sample_iter} \code{sample} draws, so the chain becomes a moving window while sampling
+continues until the other criteria are met. \code{iter} must not exceed it.
+
 The estimation is performed using particle-metropolis within-Gibbs sampling.
 For sampling details see:
 

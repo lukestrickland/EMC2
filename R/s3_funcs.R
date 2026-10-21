@@ -502,6 +502,9 @@ fit.emc <- function(emc, stage = NULL, iter = 1000, stop_criteria = NULL,
                        is.finite(final_progress$curr_min_es)) {
       sprintf("min ESS=%.0f", final_progress$curr_min_es)
     } else NULL
+    if (!is.null(final_progress$max_flat)) {
+      ess_message <- paste0(c(ess_message, sprintf("max flat=%.3f", final_progress$max_flat)), collapse = " | ")
+    }
 
     final_iters <- chain_n(emc)[1, "sample"]
 
@@ -552,6 +555,20 @@ fit.emc <- function(emc, stage = NULL, iter = 1000, stop_criteria = NULL,
 #' ``omit_mpsrf`` (Boolean): Whether to include the multivariate point-scale reduction factor in the Gelman-Rubin diagnostic. Default is ``FALSE``.
 #'
 #' ``iter`` (integer): The number of MCMC samples to collect.
+#'
+#' ``max_flat_loc`` (numeric, ``sample`` stage only): Stationarity criterion. For every
+#' column in ``flat_selection``, the absolute difference between the median of the first
+#' ``flat_p1`` and last ``flat_p2`` proportion of ``sample`` draws (chains pooled), divided
+#' by the column's IQR, must be at most ``max_flat_loc`` (e.g. 0.25). Default ``NULL`` (off).
+#'
+#' ``flat_selection`` (character vector): Which draws ``max_flat_loc`` applies to, any of
+#' ``"alpha"``, ``"subj_ll"``, ``"theta_mu"``, ``"theta_var"``. Default ``c("alpha", "subj_ll", "theta_mu")``.
+#'
+#' ``flat_p1``, ``flat_p2`` (numeric in (0, 1]): Proportions of draws compared by ``max_flat_loc``. Default 1/3 each.
+#'
+#' ``max_sample_iter`` (integer >= 10, ``sample`` stage only): Keep only the most recent
+#' ``max_sample_iter`` ``sample`` draws, so the chain becomes a moving window while sampling
+#' continues until the other criteria are met. ``iter`` must not exceed it.
 #'
 #' The estimation is performed using particle-metropolis within-Gibbs sampling.
 #' For sampling details see:

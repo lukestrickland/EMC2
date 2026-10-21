@@ -40,6 +40,21 @@ get_stop_criteria <- function(stage, stop_criteria, type){
   if(!is.null(stop_criteria$min_es) && is.null(stop_criteria$selection)){
     stop_criteria$selection <- if(type != "single") c('alpha', 'mu') else 'alpha'
   }
+  if(stage == "sample"){
+    if(!is.null(stop_criteria$max_flat_loc)){
+      if(is.null(stop_criteria$flat_selection)) stop_criteria$flat_selection <- c("alpha", "subj_ll", "theta_mu")
+      if(is.null(stop_criteria$flat_p1)) stop_criteria$flat_p1 <- 1/3
+      if(is.null(stop_criteria$flat_p2)) stop_criteria$flat_p2 <- 1/3
+      if(stop_criteria$flat_p1 <= 0 || stop_criteria$flat_p1 > 1) stop("flat_p1 must be in (0, 1].")
+      if(stop_criteria$flat_p2 <= 0 || stop_criteria$flat_p2 > 1) stop("flat_p2 must be in (0, 1].")
+      if(!all(stop_criteria$flat_selection %in% c("alpha", "subj_ll", "theta_mu", "theta_var"))){
+        stop("flat_selection must be one or more of: alpha, subj_ll, theta_mu, theta_var")
+      }
+    }
+    if(!is.null(stop_criteria$max_sample_iter) && stop_criteria$max_sample_iter < 10){
+      stop("max_sample_iter should be >= 10.")
+    }
+  }
   if(stage == "adapt" & is.null(stop_criteria$min_unique)) stop_criteria$min_unique <- 600
   if(stage != "adapt" & !is.null(stop_criteria$min_unique)) stop("min_unique only applicable for adapt stage, try min_es instead.")
   return(stop_criteria)
@@ -112,6 +127,16 @@ run_emc <- function(emc, stage, stop_criteria,
   } else{
     iter <- stop_criteria[["iter"]]
   }
+  # The sample stage is trimmed to max_sample_iter draws, so more than that can
+  # never be reached (infinite loop). When resuming a fit that already holds draws,
+  # cap the target instead of erroring.
+  if(stage == "sample" && !is.null(stop_criteria$max_sample_iter) && length(iter) > 0){
+    if(stop_criteria[["iter"]] > stop_criteria$max_sample_iter){
+      stop("stop_criteria iter (", stop_criteria[["iter"]], ") exceeds max_sample_iter (",
+           stop_criteria$max_sample_iter, "), so sampling could never finish.")
+    }
+    iter <- min(iter, stop_criteria$max_sample_iter)
+  }
   progress <- check_progress(emc, stage, iter, stop_criteria, max_tries, step_size, cores_per_chain*cores_for_chains, verbose, n_blocks = n_blocks)
   emc <- progress$emc
   progress <- progress[!names(progress) == 'emc']
@@ -163,6 +188,10 @@ run_emc <- function(emc, stage, stop_criteria,
     } else{
       emc <- sub_emc
     }
+    # Keep only the most recent max_sample_iter draws
+    if(stage == "sample" && !is.null(stop_criteria$max_sample_iter)){
+      emc <- .trim_sample_stage(emc, stop_criteria$max_sample_iter)
+    }
     progress <- check_progress(emc, stage, iter, stop_criteria, max_tries, step_size, cores_per_chain*cores_for_chains,
                                verbose, progress,n_blocks)
     emc <- progress$emc
@@ -190,6 +219,9 @@ run_emc <- function(emc, stage, stop_criteria,
       ess_message <- NULL
       if(stage == 'sample' & !is.null(progress$curr_min_es)) {
         ess_message <- paste0(" | min ESS=", round(progress$curr_min_es))
+      }
+      if(!is.null(progress$max_flat)) {
+        ess_message <- paste0(ess_message, " | max flat=", round(progress$max_flat, 3))
       }
       # Get current iteration count for the sample stage
       current_iters <- if (stage == "sample") chain_n(emc)[1, stage] else NULL
@@ -559,22 +591,40 @@ check_progress <- function (emc, stage, iter, stop_criteria,
     adapted <- adapt_converged(emc, total_iters_stage, adapt_rhat)
     adapt_rhat <- attr(adapted, "rhat"); adapted <- as.vector(adapted)
   }
-  done <- (es_done & iter_done & gd$gd_done & adapted) | (trys_done & iter_done)
-  if(es_done & gd$gd_done & adapted & !iter_done){
+  # Stationarity: median shift between early and late draws, relative to the IQR.
+  # Tested on gd$emc, i.e. after check_gd() may have dropped the first third.
+  flat_done <- TRUE
+  max_flat <- NULL
+  if(stage == "sample" && !is.null(stop_criteria$max_flat_loc)){
+    flat_out <- .check_flatness_stop(
+      emc = gd$emc,
+      max_flat_loc = stop_criteria$max_flat_loc,
+      flat_selection = stop_criteria$flat_selection,
+      flat_p1 = stop_criteria$flat_p1,
+      flat_p2 = stop_criteria$flat_p2,
+      stage = "sample"
+    )
+    flat_done <- flat_out$flat_done
+    max_flat <- flat_out$max_flat
+  }
+  done <- (es_done & iter_done & gd$gd_done & adapted & flat_done) | (trys_done & iter_done)
+  if(es_done & gd$gd_done & adapted & flat_done & !iter_done){
     step_size <- min(step_size, abs(iter - total_iters_stage))[1]
   }
   if (trys_done & iter_done) {
-    if(!(es_done & gd$gd_done & enough_unique)){
+    if(!(es_done & gd$gd_done & enough_unique & flat_done)){
       warning("Max tries reached. If this happens in burn-in while trying to get
             gelman diagnostics small enough, you might have a particularly hard model.
             Make sure your model is well specified. If so, you can run adapt and
-            sample, if run for long enough, sample usually converges eventually.")
+            sample, if run for long enough, sample usually converges eventually.",
+              if(!flat_done) "\n  Unmet criterion includes flatness (max_flat_loc)." else "")
     }
   }
   return(list(emc = gd$emc, done = done, step_size = step_size,
               trys = trys, n_blocks = gd$n_blocks, gd=gd,
               total_iters_stage=total_iters_stage, adapt_rhat = adapt_rhat,
-              curr_min_es = if (min_es > 0 && total_iters_stage != 0) curr_min_es else NULL))
+              curr_min_es = if (min_es > 0 && total_iters_stage != 0) curr_min_es else NULL,
+              max_flat = max_flat))
 }
 
 # The Rhats a stop rule reads (split_rhat()), subject-level ones from the
